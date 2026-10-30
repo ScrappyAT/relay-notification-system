@@ -38,7 +38,7 @@ export function startProcessMetricsServer(port: number, processName: string): Pr
       res.end(JSON.stringify({ code: "NOT_FOUND", message: "Not found" }));
     });
 
-    server.listen(port, () => {
+    server.listen(port, "127.0.0.1", () => {
       console.log(`[${processName}] Prometheus metrics server listening on port ${port}`);
       resolve({
         server,

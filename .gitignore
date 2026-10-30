@@ -4,6 +4,10 @@ dist/
 .env.*
 !.env.example
 coverage/
+.next/
+*.tsbuildinfo
+test-results*.json
+.local/
 bin/
 *.zip
 *.log

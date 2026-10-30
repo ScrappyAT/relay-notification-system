@@ -7,6 +7,7 @@ const envSchema = z.object({
         .default("development"),
 
     PORT: z.coerce.number().int().min(1).max(65535).default(3000),
+    DASHBOARD_ENABLED: z.enum(["true", "false"]).default("false").transform(v => v === "true"),
 
     DATABASE_URL: z.string().url(),
     DB_POOL_MAX: z.coerce.number().int().min(1).max(100).default(15),

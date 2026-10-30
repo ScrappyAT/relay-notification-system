@@ -1,0 +1,31 @@
+# Isolated localhost-only demonstration services. Credentials are disposable local defaults.
+name: relay-dashboard
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: relay_demo
+      POSTGRES_PASSWORD: relay_demo_local
+      POSTGRES_DB: relay_demo
+      TZ: UTC
+    ports:
+      - "127.0.0.1:5544:5432"
+    volumes:
+      - dashboard-postgres:/var/lib/postgresql/data
+      - ./src/database/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U relay_demo -d relay_demo"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "127.0.0.1:6390:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+volumes:
+  dashboard-postgres:

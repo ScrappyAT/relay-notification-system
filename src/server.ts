@@ -1,7 +1,7 @@
 import { app } from "./app.js";
 import { env } from "./config/env.js";
 
-const server = app.listen(env.PORT, () => {
+const server = app.listen(env.PORT, "127.0.0.1", () => {
     console.log(`Relay API running on port ${env.PORT} (RateLimit: ${env.RATE_LIMIT_MAX_REQUESTS} req / ${env.RATE_LIMIT_WINDOW_SECONDS}s)`);
 });
 
