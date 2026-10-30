@@ -1,5 +1,6 @@
 import http from "http";
 import { getMetrics } from "./registry.js";
+import { getListenOptions } from "../config/listen.js";
 
 export interface MetricsServerInstance {
   server: http.Server;
@@ -38,8 +39,9 @@ export function startProcessMetricsServer(port: number, processName: string): Pr
       res.end(JSON.stringify({ code: "NOT_FOUND", message: "Not found" }));
     });
 
-    server.listen(port, () => {
-      console.log(`[${processName}] Prometheus metrics server listening on port ${port}`);
+    const options = getListenOptions(port, "metrics");
+    server.listen(options, () => {
+      console.log(`[${processName}] Prometheus metrics server listening on ${options.host ?? "unspecified interfaces"} port ${port}`);
       resolve({
         server,
         port,

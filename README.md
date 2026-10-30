@@ -1,5 +1,9 @@
 # Relay
 
+## Local admin dashboard
+
+The Next.js, TypeScript and Tailwind CSS dashboard in `apps/dashboard` includes Overview, Send Notification, Notifications, Preferences, Monitoring and Failure Simulator. It uses the real Relay API and database. See **[DASHBOARD.md](DASHBOARD.md)** for the isolated localhost setup, startup commands, data definitions, security boundaries and verification. No tenant authentication is implemented; keep this demonstration on localhost.
+
 Multi-tenant notification infrastructure prototype designed around high-reliability distributed systems principles.
 
 **Current status:** Milestones 1–7D fully implemented and verified. Ingestion API with PostgreSQL transactional outbox, BullMQ workers, lease reconciliation, tenant rate limiting, dual-stage tenant fairness, admission backpressure, recipient notification preferences, simulated provider failures, k6 load testing, cited infrastructure cost modeling, and comprehensive Prometheus observability. 95 automated tests passing across 11 test files.

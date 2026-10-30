@@ -3,10 +3,22 @@ dist/
 .env
 .env.*
 !.env.example
+!.env.demo.example
 coverage/
+.next/
+*.tsbuildinfo
+test-results*.json
+.local/
 bin/
 *.zip
 *.log
 *test-tenants.json
-*.log
-*test-tenants.json
+# Local database, queue persistence and downloaded executables
+pgdata/
+postgres-data/
+redis-data/
+dump.rdb
+appendonly.aof*
+appendonlydir/
+*.exe
+*.msi
