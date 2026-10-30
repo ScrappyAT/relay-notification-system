@@ -11,6 +11,12 @@ import {
   recordNotificationQueued,
 } from "../metrics/index.js";
 
+/**
+ * Pattern: Transactional Outbox Pattern (Dispatch & Publication Phase)
+ * Purpose: Decouples the HTTP ingestion transaction from external message brokers (Redis/BullMQ).
+ * OutboxDispatcher continuously polls unpublished outbox events using row-level locking (SKIP LOCKED),
+ * guarantees at-least-once enqueueing with deterministic BullMQ job IDs, and updates publication status.
+ */
 export class OutboxDispatcher {
   private dispatcherRepo: OutboxDispatcherRepository;
   private notificationRepo: NotificationRepository;

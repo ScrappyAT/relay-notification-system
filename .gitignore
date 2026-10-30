@@ -4,3 +4,9 @@ dist/
 .env.*
 !.env.example
 coverage/
+bin/
+*.zip
+*.log
+*test-tenants.json
+*.log
+*test-tenants.json

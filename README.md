@@ -2,7 +2,7 @@
 
 Multi-tenant notification infrastructure prototype designed around high-reliability distributed systems principles.
 
-**Current status:** Milestones 1–6D fully implemented and verified. Ingestion API with PostgreSQL transactional outbox, BullMQ workers, lease reconciliation, tenant rate limiting, dual-stage tenant fairness, admission backpressure, and comprehensive Prometheus observability. 67 automated tests passing.
+**Current status:** Milestones 1–7D fully implemented and verified. Ingestion API with PostgreSQL transactional outbox, BullMQ workers, lease reconciliation, tenant rate limiting, dual-stage tenant fairness, admission backpressure, recipient notification preferences, simulated provider failures, k6 load testing, cited infrastructure cost modeling, and comprehensive Prometheus observability. 95 automated tests passing across 11 test files.
 
 - **[SUBMISSION.md](file:///c:/Users/HP/Desktop/relay-system/SUBMISSION.md)**: Complete graduation submission document covering architecture, reliability claims, evidence, trade-offs, and reproduction.
 - **[DEMO-GUIDE.md](file:///c:/Users/HP/Desktop/relay-system/DEMO-GUIDE.md)**: 10-minute live presentation guide with pre-demo checklist, verbatim commands, and fallback procedures.
@@ -10,8 +10,8 @@ Multi-tenant notification infrastructure prototype designed around high-reliabil
 - **[DESIGN.md](file:///c:/Users/HP/Desktop/relay-system/DESIGN.md)**: Complete technical specification and architecture document.
 - **[LEARNING-LOG.md](file:///c:/Users/HP/Desktop/relay-system/LEARNING-LOG.md)**: Engineering decisions, empirical benchmark evidence, failure drills, and lessons learned.
 
-**Implemented stack:** TypeScript, Node.js, Express 5, PostgreSQL 16 (Neon / PgBouncer), Redis 7 / BullMQ, Zod, prom-client, Vitest.  
-**Database migrations ([`src/database/migrations/`](file:///c:/Users/HP/Desktop/relay-system/src/database/migrations)):** `001_initial.sql`, `002_outbox_improvements.sql`, `003_worker_leases.sql`, `004_outbox_failure_handling.sql`, `005_notification_lifecycle.sql`.
+**Implemented stack:** TypeScript, Node.js, Express 5, PostgreSQL 16 (Neon / PgBouncer), Redis 7 / BullMQ, Zod, prom-client, Vitest.
+**Database migrations ([`src/database/migrations/`](file:///c:/Users/HP/Desktop/relay-system/src/database/migrations)):** `001_initial.sql`, `002_outbox_improvements.sql`, `003_worker_leases.sql`, `004_outbox_failure_handling.sql`, `005_notification_lifecycle.sql`, `006_notification_preferences.sql`.
 
 ---
 
@@ -101,7 +101,7 @@ Check the dispatcher logs:
 > SELECT id, status, updated_at FROM notifications WHERE id = '<NOTIFICATION_ID>';
 > -- Expected: status = 'pending'
 >
-> SELECT id, notification_id, published_at, attempts, locked_until, failed_at 
+> SELECT id, notification_id, published_at, attempts, locked_until, failed_at
 > FROM outbox_events WHERE notification_id = '<NOTIFICATION_ID>';
 > -- Expected: published_at IS NULL, failed_at IS NULL
 > ```
@@ -132,14 +132,14 @@ Execute the post-recovery verification query:
 
 ```sql
 -- 1. Check notification lifecycle state:
-SELECT id, customer_id, channel, status, created_at, updated_at 
-FROM notifications 
+SELECT id, customer_id, channel, status, created_at, updated_at
+FROM notifications
 WHERE id = '<NOTIFICATION_ID>';
 -- Expected: status = 'processed'
 
 -- 2. Check outbox event publication:
-SELECT id, notification_id, event_type, published_at, attempts, locked_until, failed_at, failure_reason 
-FROM outbox_events 
+SELECT id, notification_id, event_type, published_at, attempts, locked_until, failed_at, failure_reason
+FROM outbox_events
 WHERE notification_id = '<NOTIFICATION_ID>';
 -- Expected:
 --   published_at IS NOT NULL
@@ -410,5 +410,142 @@ curl -s http://localhost:3000/metrics | grep "relay_backpressure"
 - `relay_dependency_check_failures_total{dependency="postgres|redis"}`: Dependency probe failure counter.
 - `relay_backpressure_state_seconds_total{state="..."}`: Time spent in each operational state.
 
+---
 
+## Milestone 7A: Recipient Notification Preferences
 
+Relay implements tenant-scoped recipient notification preferences to provide granular opt-in/opt-out control over communication channels (`email`, `sms`) while preserving transactional consistency, durable auditability, and deterministic idempotency.
+
+### 1. Key Invariants & Architectural Rules
+
+- **Pre-Queue Ingestion Evaluation:** Recipient channel preferences are evaluated inside the **same active database transaction** as notification creation.
+- **Suppression vs Acceptance Contract:**
+  - **Accepted (`enabled: true` or default-allow):** Returns `HTTP 202 Accepted` with `status: "pending"`. Outbox event created; enqueued to BullMQ.
+  - **Suppressed (`enabled: false`):** Returns `HTTP 200 OK` with `status: "suppressed"` and `suppressionReason: "recipient_preference_disabled"`.
+  - **Zero Outbox Leakage:** Suppressed notifications generate **0 rows** in `outbox_events` and **0 jobs** in BullMQ queues.
+- **Deterministic Idempotency:** Replaying a suppressed request with the same idempotency key permanently returns the original `HTTP 200` suppression response (`isReplay: true`), even if the recipient subsequently enables the channel.
+- **Default-Allow Prototype Convention:** Unconfigured recipient channels default to allowed. *(Note: Prototype testing assumption, not a substitute for legally mandated affirmative marketing consent).*
+- **Tenant Isolation:** Preferences are partitioned strictly by `(customer_id, recipient, channel)`. Disabling an email under Tenant A has zero effect on Tenant B.
+
+### 2. Preference Management API
+
+```bash
+# 1. Opt-out an email recipient for a tenant:
+curl -i -X PUT http://localhost:3000/v1/recipients/preferences \
+  -H "Content-Type: application/json" \
+  -d '{
+    "customerId": "d600ffb8-91ac-46ec-8837-c8455c9ffe5b",
+    "recipient": "user@example.com",
+    "channel": "email",
+    "enabled": false
+  }'
+
+# 2. Query preferences for a recipient:
+curl -s "http://localhost:3000/v1/recipients/preferences?customerId=d600ffb8-91ac-46ec-8837-c8455c9ffe5b&recipient=user@example.com"
+```
+
+### 3. Verification Commands
+
+```bash
+# 1. Run all 13 preference integration tests:
+npm.cmd test -- tests/preferences.test.ts
+
+# 2. Run the complete Relay regression test suite (95 tests across 11 suites):
+npm.cmd test
+```
+
+## Milestone 7B: Simulated Provider Failures, Retries & State Recovery
+
+Relay implements configurable simulated external delivery adapters for Email (`SendGrid-Simulator`) and SMS (`Twilio-Simulator`) to demonstrate delivery success, transient backoff, permanent failure fast-termination, network timeout handling, and automatic recovery.
+
+### 1. Provider Failure Taxonomy & State Invariants
+
+- **`provider_accepted` (HTTP 200/202):** Provider confirmed acceptance of delivery request; realistic provider message ID generated; atomic worker lease released.
+- **`processing` (HTTP 503 / HTTP 429):** Downstream transient outage or provider rate limit; PostgreSQL lease released immediately (`processing_locked_until = NULL`, `claim_token = NULL`); BullMQ retries using exponential backoff.
+- **`failed` (HTTP 400 Bad Request):** Permanent, non-retryable rejection (invalid address / unroutable number); worker updates status to `failed` and throws `UnrecoverableError` to immediately abort BullMQ retries without consuming futile attempts.
+- **`failed` (Retry Exhaustion):** Notification transitions to terminal `failed` status when maximum configured retry attempts (`job.opts.attempts = 5`) are exhausted.
+- **`outcome_unknown` (Network Timeout):** Socket read times out after HTTP dispatch; outcome across the carrier boundary is indeterminate; worker updates status to `outcome_unknown` and halts blind retries to prevent duplicate message dispatch.
+- **`suppressed` (Preference Opt-Out):** Ingested via API with `HTTP 200 OK`; zero outbox rows created; never invokes provider adapters.
+
+### 2. Failure Drill Demonstration
+
+Execute the standalone failure drill simulating all 6 operational failure and recovery scenarios:
+
+```bash
+npx tsx scripts/providerFailureDrill.ts
+```
+
+Drill Scenarios Verified:
+1. Transient 503 Outage: Attempt 1 fails (503), lease released, Attempt 2 recovers with 202 (`provider_accepted`).
+2. Provider 429 Rate Limiting: Attempt 1 rejected (429), Attempt 2 recovers with 202 (`provider_accepted`).
+3. Permanent 400 Rejection: Fast termination to `failed` via `UnrecoverableError` (exactly 1 provider call).
+4. Socket Read Timeout: Transition to `outcome_unknown` preventing duplicate message dispatch (1 call).
+5. Retry Exhaustion: Prolonged 503 outage across all attempts transitions to terminal `failed`.
+6. Clean Recovery: Unaffected traffic delivers cleanly with 202 (`provider_accepted`).
+
+### 3. Automated Test Verification
+
+```bash
+# 1. Run all 15 provider failure tests:
+npx.cmd vitest run tests/providerFailures.test.ts
+
+# 2. Run the complete Relay regression test suite (95 tests across 11 suites):
+npm.cmd test
+```
+
+## Milestone 7C: k6 Load Testing & Concurrency Benchmarks
+
+Relay includes a genuine Grafana k6 load-testing suite ([`scripts/k6/load-test.js`](file:///c:/Users/HP/Desktop/relay-system/scripts/k6/load-test.js)) evaluating the prototype under baseline, gradual ramp-up, and spike traffic patterns against live remote Neon PostgreSQL and local Redis.
+
+### 1. Test Scenarios Implemented
+
+- **Scenario A (Baseline Ingress):** 3 constant VUs for 20s. Evaluates unconstrained normal operation. (Result: 1.70 req/s total & accepted, 100% accepted, 0 rate limits, 0 errors).
+- **Scenario B (Gradual Ramp-Up):** 2 to 35 VUs over 50s. Identifies latency inflection (~20 VUs), rate limiting activation (HTTP 429 at 100 req/60s), and backpressure activation (HTTP 503 at >90% DB pool utilization). (Result: 28.33 total HTTP req/s evaluated, 4.13 accepted/s, 890 rate-limited, 352 overload deflections, 0 server crashes).
+- **Scenario C (Short Spike):** Rapid burst to 30 VUs for 6s followed by immediate return to baseline. Demonstrates immediate load shedding via HTTP 503 and complete sub-2s recovery back to normal HTTP 202 acceptance. (Result: 23.34 total HTTP req/s, 3.30 accepted/s, 615 overload deflections, 0 errors).
+
+### 2. Execution Instructions
+
+```bash
+# 1. Start Relay services (API on port 3000 + Outbox Dispatcher + Workers)
+npx tsx scripts/k6/start-relay-services.ts
+
+# 2. Seed dedicated test tenants (in a separate terminal)
+npx tsx scripts/k6/seed-tenants.ts
+
+# 3. Execute Scenario A: Baseline
+.\bin\k6.exe run -e SCENARIO=baseline scripts/k6/load-test.js
+
+# 4. Execute Scenario B: Gradual Ramp-Up
+.\bin\k6.exe run -e SCENARIO=ramp_up scripts/k6/load-test.js
+
+# 5. Execute Scenario C: Short Spike
+.\bin\k6.exe run -e SCENARIO=spike scripts/k6/load-test.js
+
+# 6. Verify post-test queue drain and provider acceptance
+npx tsx scripts/k6/verify-drain.ts
+
+# 7. Clean up test tenants and notification records
+npx tsx scripts/k6/cleanup-tenants.ts
+```
+
+Detailed test metrics and analysis are documented in [`benchmarks/k6/REPORT.md`](file:///c:/Users/HP/Desktop/relay-system/benchmarks/k6/REPORT.md).
+
+---
+
+## Milestone 7D: Infrastructure Cost Estimation (100,000 Users)
+
+Relay includes a comprehensive monthly infrastructure cost model for a deployment of **100,000 registered end-user recipients** across 100 tenant organizations, documented in [`benchmarks/COST-MODEL.md`](file:///c:/Users/HP/Desktop/relay-system/benchmarks/COST-MODEL.md) using official provider pricing pages verified on **30 October 2026**:
+
+| Scenario | Active Ratio (MAU) | Monthly Volume | Channel Mix (Email / SMS) | Server Infra | Third-Party Telecom | Total Monthly Cost | Cost / 1k Notifs |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Scenario A (Low)** | 30% (30k MAU) | 60,000 / mo | 85% Email / 15% SMS | $43.38 | $120.25 | **$163.63** | **$2.73** |
+| **Scenario B (Expected)** | 60% (60k MAU) | 300,000 / mo | 80% Email / 20% SMS | $136.19 | $776.65 | **$912.84** | **$3.04** |
+| **Scenario C (High)** | 85% (85k MAU) | 1,700,000 / mo | 75% Email / 25% SMS | $369.46 | $5,452.30 | **$5,821.76** | **$3.42** |
+
+*(Under strict fixed baseline subscriptions vs. volume-variable consumption, Scenario B divides into **$130.69 fixed subscriptions** [compute, baseline DB, Redis, Grafana base, phone numbers, 10DLC campaign] and **$782.15 variable usage** [SES emails, SMS segments, storage, logs, egress], totaling **$912.84**).*
+
+### Key Economic Findings
+- **SMS Dominance:** Telecommunications carrier fees for SMS dwarf compute infrastructure, accounting for **85.1%** of monthly expenditure in Scenario B ($776.65 of $912.84). Sending 1,000 SMS ($12.50) is **125x more expensive** than sending 1,000 emails ($0.10 via Amazon SES).
+- **Protective Safeguard Value:** Tenant Rate Limiting (Milestone 6B) and Recipient Preference Suppression (Milestone 7A) serve as essential financial circuit-breakers that protect tenant budgets from runaway billing.
+- **Capacity Sufficiency Caveat:** Scenarios A (0.23 req/s peak) and B (1.16 req/s peak) operate within single-node prototype capacity (1.70 req/s baseline in k6). Scenario C (6.56 req/s peak) requires 2 horizontal API pods with connection pooling; this multi-node topology is budgeted but unbenchmarked in the single-node prototype.
+- **Architectural Target Distinction:** The 50M/day target (1.5B/month) is 5,000x larger than the 100k-user workload and cannot be extrapolated linearly. At that scale, production systems require enterprise aggregator master service agreements, multi-tenant PostgreSQL database sharding, and distributed streaming brokers (Kafka/Pulsar).

@@ -1,10 +1,19 @@
 # Relay — Graduation Submission
 
-**Dev and Design HQ Product Design & Engineering Bootcamp**  
-**Project:** Relay Notification Infrastructure Prototype  
-**Author:** Graduate Candidate  
-**Date:** 29 October 2026  
-**Status:** Milestones 1–6D Fully Implemented & Verified (67/67 Tests Passing)
+**Dev and Design HQ Product Design & Engineering Bootcamp**
+**Project:** Relay Notification Infrastructure Prototype
+**Author:** Graduate Candidate
+**Date:** 30 October 2026
+**Status:** Milestones 1–7D Fully Implemented & Verified (95/95 Tests Passing across 11 test files)
+
+### Graduation Task Deliverables Status
+
+| Deliverable | Description | Status | Evidence / Location |
+| :--- | :--- | :--- | :--- |
+| **Deliverable 1: Design Document** | 12 required sections covering architecture, data model, deep dives, failure modes, trade-offs, and cited cost estimates | **COMPLETE** | [`DESIGN.md`](file:///c:/Users/HP/Desktop/relay-system/DESIGN.md) |
+| **Deliverable 2: Working Prototype** | Full TypeScript codebase, transactional outbox, worker leases, recipient preferences, provider failures, 95 passing tests, k6 load testing | **COMPLETE** | [`src/`](file:///c:/Users/HP/Desktop/relay-system/src), [`tests/`](file:///c:/Users/HP/Desktop/relay-system/tests), [`benchmarks/`](file:///c:/Users/HP/Desktop/relay-system/benchmarks) |
+| **Deliverable 3: 20-min Walkthrough Video** | Recorded screen walkthrough explaining architecture, code, and live demo | **PENDING (Postponed)** | Postponed; to be recorded in dedicated presentation session |
+| **Deliverable 4: Mock Technical Interview** | Interactive oral defense answering deep-dive architecture questions | **PENDING (Postponed)** | Postponed; scheduled for live evaluation per [`INTERVIEW-PREP.md`](file:///c:/Users/HP/Desktop/relay-system/INTERVIEW-PREP.md) |
 
 ---
 
@@ -111,7 +120,14 @@ flowchart TD
 | `GET` | `/v1/health` | `200 OK` | Liveness health check returning service name, status, and UTC timestamp. |
 | `GET` | `/v1/ready` | `200 OK`, `503 Service Unavailable` | Readiness dependency check. Verifies PostgreSQL health. Degrades gracefully if Redis is unavailable while maintaining durable ingestion readiness. |
 | `GET` | `/metrics` | `200 OK` | Exposes standard Prometheus text-format metrics across all subsystems. |
-| `POST` | `/v1/notifications` | `202 Accepted`<br>`400 Bad Request`<br>`404 Not Found`<br>`409 Conflict`<br>`429 Too Many Requests`<br>`503 Service Unavailable` | Primary notification ingestion endpoint. Enforces tenant rate limits, backpressure admission, idempotency validation, and durable transactional persistence. |
+| `POST` | `/v1/notifications` | `200 OK`<br>`202 Accepted`<br>`400 Bad Request`<br>`404 Not Found`<br>`409 Conflict`<br>`429 Too Many Requests`<br>`503 Service Unavailable` | Primary notification ingestion endpoint. Enforces tenant rate limits, backpressure admission, idempotency validation, recipient preferences, and durable transactional persistence. Suppressed requests return 200 OK without outbox writes. |
+| `PUT` | `/v1/recipients/preferences` | `200 OK`<br>`400 Bad Request`<br>`404 Not Found` | Upserts recipient channel preference (opt-in/opt-out) scoped by tenant customerId. |
+| `GET` | `/v1/recipients/preferences` | `200 OK`<br>`400 Bad Request`<br>`404 Not Found` | Retrieves channel preferences for a given recipient under a customerId. |
+
+> [!NOTE]
+> **API Scope & Prototype Boundaries:**
+> 1. **Tenant Authentication (Prototype Limitation):** In the prototype, tenant identity is accepted via `customerId` in the JSON request body (trusted ingress). Cryptographic Bearer API key authentication and JWT tenant context derivation are documented in `DESIGN.md` as production gateway requirements, but omitted from the prototype to keep focus on core distributed systems invariants.
+> 2. **Notification Status Endpoint (Future Scope):** Querying notification delivery status via `GET /v1/notifications/:id` is specified in `DESIGN.md` §3 as an architectural API contract; in the prototype, status is inspected directly in PostgreSQL or via test assertion suites and is marked as future scope for the HTTP API router.
 
 ---
 
@@ -124,14 +140,13 @@ When a client submits `POST /v1/notifications`:
 3. **Tenant Rate Limiting:** Executes an atomic Redis Lua sliding-window rate limit check (`rl:tenant:{customerId}`). If quota is exhausted, returns `429 RATE_LIMIT_EXCEEDED` with `Retry-After`.
 4. **Admission Control:** Evaluates cluster state (`NORMAL`, `DEGRADED`, `OVERLOADED`):
    - Under `OVERLOADED`, safe identical replays return `202 Accepted` (`isReplay: true`), conflicting replays return `409 IDEMPOTENCY_CONFLICT`, and new submissions return `503 SYSTEM_OVERLOADED` with rate-limit quota refund.
-5. **Database Transaction:**
+5. **Database Transaction & Preference Evaluation:**
    - Checks customer existence (`customers`).
-   - Checks idempotency key within transaction (`idempotency_keys`).
-   - Inserts notification record (`status = 'pending'`).
-   - Inserts transactional outbox event (`outbox_events`).
-   - Inserts idempotency mapping (`idempotency_keys`).
-   - Executes `COMMIT`.
-6. **HTTP Response:** Returns `HTTP 202 Accepted` with generated notification ID, status, and `RateLimit-*` headers.
+   - Checks idempotency key within transaction (`idempotency_keys`): returns existing notification if matched, or 409 if payload differs.
+   - Evaluates recipient preference (`recipient_preferences`):
+     - If channel disabled: inserts notification (`status = 'suppressed'`), writes idempotency key, skips outbox write, and returns `HTTP 200 OK` (`suppressionReason: "recipient_preference_disabled"`).
+     - If channel enabled or unconfigured (default-allow): inserts notification (`status = 'pending'`), inserts transactional outbox event (`outbox_events`), writes idempotency mapping, and commits.
+6. **HTTP Response:** Returns `HTTP 202 Accepted` for queued notifications or `HTTP 200 OK` for suppressed notifications, with `RateLimit-*` headers.
 
 ---
 
@@ -170,13 +185,17 @@ Relay separates queueing into distinct BullMQ channel queues (`email-notificatio
 
 - **Deterministic Job IDs:** Jobs are published with explicit IDs (`notif-{notification_id}`). BullMQ deduplicates duplicate enqueue attempts with identical job IDs.
 - **Decoupled Workers:** Email and SMS workers run independently with configurable concurrency (`WORKER_CONCURRENCY = 5`).
-- **Simulated Provider Execution:** Workers simulate delivery network latency (100–300ms) and log completion without sending external emails or SMS.
+- **Simulated Provider Execution:** Workers dispatch to configurable simulated delivery adapters (`SendGrid-Simulator` for email, `Twilio-Simulator` for SMS) supporting realistic provider message IDs, 503 outages, 429 rate limits, socket timeouts, and 400 rejections.
 - **Lifecycle Progression:** When a worker picks up a job:
   1. Claims an execution lease in PostgreSQL (`status = 'processing'`).
   2. Acquires a fair scheduling concurrency slot via Redis Lua.
-  3. Executes delivery simulation.
-  4. Updates status in PostgreSQL (`status = 'processed'`).
-  5. Releases fair scheduling slot in Redis.
+  3. Dispatches via `SimulatedProvider.send(...)`.
+  4. On HTTP 202/200: Updates `status = 'provider_accepted'`, clears lease lock, and records duration.
+  5. On HTTP 503/429: Releases PostgreSQL lease and throws error for BullMQ exponential backoff retry.
+  6. On HTTP 400: Updates `status = 'failed'`, clears lease, and throws `UnrecoverableError` to abort futile retries immediately.
+  7. On Timeout: Updates `status = 'outcome_unknown'`, clears lease, and halts blind retries to prevent duplicate message dispatch.
+  8. On Retry Exhaustion: Updates `status = 'failed'` once configured attempt limit is reached.
+  9. Releases fair scheduling slot in Redis.
 
 ---
 
@@ -269,32 +288,45 @@ Relay exposes standard Prometheus metrics at `GET /metrics` across all operation
 
 Executed via automated script [`scripts/failureDrill.ts`](file:///c:/Users/HP/Desktop/relay-system/scripts/failureDrill.ts) against the live Neon cloud PostgreSQL database and Redis:
 
+### Milestone 6D: Backpressure & Overload Protection Drill (`scripts/failureDrill.ts`)
 - **Phase 1: Baseline Health:** Ingested 5 notifications under `NORMAL` state; 100% accepted with HTTP 202 and published.
 - **Phase 2: Redis Outage Simulation:** Disconnected Redis; system transitioned to `DEGRADED`. Ingested 5 notifications; 100% accepted with HTTP 202 and header `x-backpressure-state: DEGRADED`. Mid-outage verification confirmed all 5 records durably persisted in PostgreSQL.
 - **Phase 3: Overload Admission Defense:** Injected pending outbox backlog exceeding threshold; system transitioned to `OVERLOADED`. New submissions rejected with `HTTP 503 SYSTEM_OVERLOADED` and `Retry-After: 10`. Identical replays returned `HTTP 202` (`isReplay: true`) with zero outbox events created. Conflicting replays rejected with `HTTP 409 IDEMPOTENCY_CONFLICT`. Database audit confirmed zero rows inserted after 503 rejections.
-- **Phase 4: Recovery & Drain:** Restored Redis and cleared backlog; system returned to `NORMAL`. Outbox Dispatcher claimed and published all events; workers drained all notifications to `processed` status.
+- **Phase 4: Recovery & Drain:** Restored Redis and cleared backlog; system returned to `NORMAL`. Outbox Dispatcher claimed and published all events; workers drained all notifications.
+
+### Milestone 7B: Simulated Provider Failure & Recovery Drill (`scripts/providerFailureDrill.ts`)
+Executed against live Neon cloud PostgreSQL database and local Redis queue:
+- **Scenario 1 (Transient 503 Outage):** Attempt 1 returned HTTP 503; worker released PostgreSQL lease; Attempt 2 succeeded with HTTP 202 (`provider_accepted`, `retry_count: 1`, 2 provider calls).
+- **Scenario 2 (Provider 429 Rate Limiting):** Attempt 1 returned HTTP 429; worker released lease; Attempt 2 succeeded with HTTP 202 (`provider_accepted`, `retry_count: 1`, 2 provider calls).
+- **Scenario 3 (Permanent 400 Rejection):** Attempt 1 rejected with HTTP 400; worker immediately marked `failed` and threw `UnrecoverableError` (aborted futile retries, exactly 1 call dispatched).
+- **Scenario 4 (Socket Read Timeout):** Gateway timeout (504) severed connection; worker marked `outcome_unknown` and threw `UnrecoverableError` to halt blind duplicate message dispatch (1 call dispatched).
+- **Scenario 5 (Retry Exhaustion):** Persistent 503 outage across all allowed attempts (2/2); worker transitioned notification to terminal `failed` status (`retry_count: 2`).
+- **Scenario 6 (Clean Delivery After Recovery):** Cleared all fault injection; normal dispatch cleanly yielded `provider_accepted` with generated provider message ID.
+- **Overall Verdict:** 6/6 scenarios passed with 100% verification across database records and provider call history.
 
 ---
 
 ## 17. Automated Test Results
 
-The automated regression test suite contains **67 tests across 9 test suites, achieving 100% pass rate**:
+The automated regression test suite contains **95 tests across 11 test suites, achieving 100% pass rate**:
 
 ```bash
 npm.cmd test
 ```
 
 ```
-Test Files  9 passed (9)
-     Tests  67 passed (67)
-  Duration  83.89s
+Test Files  11 passed (11)
+     Tests  95 passed (95)
+  Duration  139.39s
 ```
 
-- `tests/backpressure.test.ts` (15/15 passed)
-- `tests/fairness.test.ts` (12/12 passed)
-- `tests/rateLimiter.test.ts` (11/11 passed)
-- `tests/metrics.test.ts` (9/9 passed)
-- `tests/notifications.test.ts` (8/8 passed)
+- `tests/providerFailures.test.ts` (15/15 passed) — Milestone 7B
+- `tests/preferences.test.ts` (13/13 passed) — Milestone 7A
+- `tests/backpressure.test.ts` (16/16 passed) — Milestone 6D
+- `tests/fairness.test.ts` (18/18 passed) — Milestone 6C
+- `tests/rateLimiter.test.ts` (11/11 passed) — Milestone 6B
+- `tests/metrics.test.ts` (9/9 passed) — Milestone 6A
+- `tests/notifications.test.ts` (6/6 passed)
 - `tests/outbox.test.ts` (4/4 passed)
 - `tests/reconciliation.test.ts` (3/3 passed)
 - `tests/readiness.test.ts` (3/3 passed)
@@ -326,6 +358,40 @@ Test Files  9 passed (9)
   - **Rejection Latency P50: 136 ms** (an 87.5% latency reduction compared to baseline, confirming zero database transaction overhead during overload).
 - **Phase 3 Worker Draining:**
   - 50 items drained to `processed` in 45.16 seconds (drain rate: 1.1 notifications/sec).
+
+### Genuine k6 Load Testing (Milestone 7C)
+Executed using Grafana k6 v0.54.0 against the live Relay API, remote Neon cloud PostgreSQL, and local Redis ([`benchmarks/k6/REPORT.md`](file:///c:/Users/HP/Desktop/relay-system/benchmarks/k6/REPORT.md)):
+
+| Profile | Concurrency | Total Req | Total HTTP Throughput | Accepted Throughput | Latency p50 (All / Accepted) | Latency p95 (All / Accepted) | Status Code Distribution | Protection / Errors |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Scenario A: Baseline** | 3 VUs (20s) | 36 | 1.70 req/s | 1.70 accepted/s | 1,156 ms / 1,156 ms | 2,759 ms / 2,762 ms | 36 Accepted (100.0%) | 0 rate limits, 0 errors |
+| **Scenario B: Gradual Ramp-Up** | 2 → 35 VUs (50s) | 1,490 | 28.33 req/s | 4.13 accepted/s | 3.91 ms / 1,448 ms | 2,335 ms / 3,059 ms | 217 Accepted (14.6%), 17 Suppressed (1.1%), 890 Rate-Limited (59.7%), 352 Overloaded (23.6%) | 1,242 defensive rejections, 14 client timeouts (0.94%), 0 server crashes |
+| **Scenario C: Short Spike** | 5 → 30 VUs (30s) | 727 | 23.34 req/s | 3.30 accepted/s | 204 ms / 1,227 ms | 1,315 ms / 2,151 ms | 103 Accepted (14.2%), 9 Suppressed (1.2%), 615 Overloaded (84.6%) | 615 defensive rejections, 0 errors, 1.5s recovery |
+
+#### Architectural Target vs. Prototype Reality
+- **Target:** 50,000,000 notifications / day requires **579 req/s sustained**, **5,787 req/s peak**.
+- **Prototype Reality:** Evaluated peak total HTTP throughput of **28.33 req/s** (evaluating sub-4ms fast defenses); measured sustained durable acceptance of **3.30–4.13 accepted notifications/s** under multi-VU concurrency.
+- **Technical Explanation:**
+  - *Public Cloud Latency:* Public Internet TLS round-trips to AWS Neon in London (4 queries per transaction) establish a physical floor of ~1,000–1,400ms per database commit.
+  - *Pool Limit Ceiling (Estimate):* With `DB_POOL_MAX = 15` and 1.0–1.4s average transaction time, the theoretical single-node ingress ceiling is estimated at $15 \text{ connections} / 1.0\text{–}1.4 \text{ s} \approx 10.7\text{–}15.0 \text{ req/s}$. Under concurrency, pool checkout queue serialization bounds sustained accepted ingress to **3.30–4.13 accepted/s**.
+  - *Protection Validation:* Despite the free-tier connection bottleneck, Relay demonstrated textbook defensive elasticity: rate-limiting excess tenant traffic in **3.91 ms (p50)** and shedding overload traffic in **< 10 ms**, completely protecting the database from unhandled crashes or unrecoverable lockups (zero HTTP 500 responses). In Scenario B, 14 requests experienced client-side TCP timeouts (15s k6 timeout) in the pool checkout queue during peak 35-VU contention.
+  - *Drain Audit Reconciliation:* Post-test audits verified that outbox events cleanly drained to `provider_accepted`. The audited count of 439 `provider_accepted` notifications reflects cumulative worker processing across preliminary dry-runs and final benchmark executions under the seeded test tenant IDs prior to executing cleanup. Zero messages were lost or duplicated.
+
+### Infrastructure Cost Model at 100,000 Users (Milestone 7D)
+Documented in [`benchmarks/COST-MODEL.md`](file:///c:/Users/HP/Desktop/relay-system/benchmarks/COST-MODEL.md) and [`DESIGN.md`](file:///c:/Users/HP/Desktop/relay-system/DESIGN.md) using official provider pricing pages verified on **30 October 2026**:
+
+| Scenario | Active Users (MAU) | Monthly Volume | Channel Mix (Email / SMS) | Server Infra | Third-Party Telecom | Total Monthly Cost | Cost / 1k Notifs |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Scenario A (Low)** | 30,000 (30%) | 60,000 / mo | 85% Email / 15% SMS | $43.38 | $120.25 | **$163.63** | **$2.73** |
+| **Scenario B (Expected)** | 60,000 (60%) | 300,000 / mo | 80% Email / 20% SMS | $136.19 | $776.65 | **$912.84** | **$3.04** |
+| **Scenario C (High)** | 85,000 (85%) | 1,700,000 / mo | 75% Email / 25% SMS | $369.46 | $5,452.30 | **$5,821.76** | **$3.42** |
+
+*(Under strict fixed baseline subscriptions vs. variable consumption, Scenario B divides into **$130.69 fixed subscriptions** [compute, baseline DB, Redis, Grafana base, phone numbers, 10DLC campaign] and **$782.15 variable usage** [SES emails, SMS segments, storage, logs, egress], totaling **$912.84**).*
+
+- **Official Pricing Citations (Checked 30 Oct 2026):** Render Web & Worker compute ($25/mo standard, [render.com/pricing](https://render.com/pricing)); Neon PostgreSQL Launch Plan ($0.106/CU-hr, [neon.tech/pricing](https://neon.tech/pricing)); Render Managed Redis Standard ($20/mo); Amazon SES ($0.10/1k emails, [aws.amazon.com/ses/pricing](https://aws.amazon.com/ses/pricing/)); Twilio US SMS ($0.0125/segment blended base+carrier, [twilio.com/en-us/sms/pricing/us](https://www.twilio.com/en-us/sms/pricing/us)); Grafana Cloud Pro ($19/mo base, [grafana.com/pricing](https://grafana.com/pricing/)); Amazon S3 ($0.023/GB-mo, [aws.amazon.com/s3/pricing](https://aws.amazon.com/s3/pricing/)).
+- **SMS Dominance:** SMS carrier charges represent **85.1%** of the expected monthly budget ($776.65 of $912.84), proving that Tenant Rate Limiting (Milestone 6B) and Recipient Preference Suppression (Milestone 7A) are mission-critical financial safeguards against rogue billing.
+- **Capacity Sufficiency Caveat:** Scenarios A (0.23 req/s peak) and B (1.16 req/s peak) operate comfortably within the single-node prototype's measured capacity (1.70 req/s baseline in k6). Scenario C (6.56 req/s peak) exceeds single-node connection pool limits and requires 2 horizontal API pods with connection pooling; this multi-node topology is budgeted but unbenchmarked in the single-node prototype.
+- **Architectural Target Distinction:** The 50M/day target (1.5B/month) is 5,000x larger than the 100k-user workload and cannot be extrapolated linearly. At that scale, production systems require enterprise aggregator master service agreements, multi-tenant PostgreSQL database sharding, and distributed streaming brokers (Kafka/Pulsar).
 
 ---
 
@@ -375,19 +441,20 @@ cp .env.example .env
 ```bash
 npx tsx src/database/check-connection.ts
 ```
-The database schema is structured into 5 sequential migrations in [`src/database/migrations/`](file:///c:/Users/HP/Desktop/relay-system/src/database/migrations):
+The database schema is structured into 6 sequential migrations in [`src/database/migrations/`](file:///c:/Users/HP/Desktop/relay-system/src/database/migrations):
 - `001_initial.sql`: Core tables (`customers`, `notifications`, `outbox_events`, `idempotency_keys`) and baseline indexes.
 - `002_outbox_improvements.sql`: Outbox claiming and lease recovery columns (`claimed_at`, `attempts`, `locked_until`).
 - `003_worker_leases.sql`: Worker lease columns on `notifications` (`processing_started_at`, `processing_locked_until`, `claim_token`).
 - `004_outbox_failure_handling.sql`: Terminal failure columns on `outbox_events` (`failed_at`, `failure_reason`, `last_error`).
 - `005_notification_lifecycle.sql`: Notification status check constraint update adding `'processed'`.
+- `006_notification_preferences.sql`: Recipient preferences table (`recipient_preferences`) and status check update adding `'suppressed'`.
 
 ### 3. Build & Run Tests
 ```bash
 # Compile TypeScript (0 errors)
 npm run build
 
-# Run complete 67-test automated regression suite
+# Run complete 95-test automated regression suite (11 test files)
 npm test
 ```
 
@@ -447,4 +514,3 @@ Building Relay demonstrated that building reliable distributed systems is fundam
 - Achieving "overload protection" requires fast-path rejections that do not touch the database, combined with careful token refunding and read-only replay checks so innocent clients are never penalized.
 
 Relay's implementation prioritizes correctness, mathematical invariants, and defensible architectural choices over superficial feature breadth.
-

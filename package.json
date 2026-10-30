@@ -14,6 +14,7 @@
     "drill": "tsx scripts/failureDrill.ts",
     "load-test": "tsx scripts/loadTest.ts",
     "smoke": "tsx scripts/smokeTest.ts",
+    "migrate": "tsx scripts/migrate.ts",
     "test": "vitest run",
     "test:watch": "vitest"
   },

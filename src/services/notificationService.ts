@@ -3,10 +3,21 @@ import { NotificationRepository } from "../repositories/notificationRepository.j
 import { OutboxRepository } from "../repositories/outboxRepository.js";
 import { IdempotencyRepository } from "../repositories/idempotencyRepository.js";
 import { CustomerRepository } from "../repositories/customerRepository.js";
+import { preferenceService } from "./preferenceService.js";
 import { computeRequestHash } from "../utils/hash.js";
 import { NotificationRequest } from "../validation/notification.js";
 import { recordNotificationAccepted } from "../metrics/index.js";
 
+/**
+ * Pattern: Transactional Outbox Pattern
+ * Purpose: Ensures atomic consistency between notification state persistence and event publishing.
+ * Notifications, idempotency keys, and outbox events are committed in a single PostgreSQL transaction,
+ * completely eliminating dual-write failure windows where notifications are persisted but never queued.
+ *
+ * Pattern: Repository Pattern
+ * Purpose: Delegating database access to NotificationRepository, OutboxRepository, and IdempotencyRepository
+ * encapsulates SQL query logic and transaction handling behind testable domain abstractions.
+ */
 export class NotificationService {
   private notificationRepo: NotificationRepository;
   private outboxRepo: OutboxRepository;
@@ -23,7 +34,7 @@ export class NotificationService {
   async submitNotification(
     request: NotificationRequest,
     idempotencyKey: string
-  ): Promise<{ status: number; body: any; isReplay?: boolean }> {
+  ): Promise<{ status: number; body: any; isReplay?: boolean; isSuppressed?: boolean }> {
     const requestHash = computeRequestHash(request);
 
     const client = await pool.connect();
@@ -58,16 +69,21 @@ export class NotificationService {
             existingIdempotency.notification_id
           );
           await client.query("COMMIT");
+
+          const isSuppressed = existingNotification.status === "suppressed";
           return {
-            status: 202,
+            status: isSuppressed ? 200 : 202,
             isReplay: true,
+            isSuppressed,
             body: {
               id: existingNotification.id,
               customerId: existingNotification.customer_id,
               recipient: existingNotification.recipient,
               channel: existingNotification.channel,
               status: existingNotification.status,
+              ...(isSuppressed ? { suppressionReason: "recipient_preference_disabled" } : {}),
               createdAt: existingNotification.created_at,
+              isReplay: true,
             },
           };
         } else {
@@ -83,7 +99,55 @@ export class NotificationService {
         }
       }
 
-      // Create notification, outbox event, and idempotency record atomically
+      // Milestone 7A: Evaluate recipient preference within the transaction
+      // Point of Authority: The preference decision is evaluated inside the active database transaction.
+      // Recipients without saved preferences default to enabled (default-allow prototype policy).
+      const preference = await preferenceService.isChannelEnabled(
+        client,
+        request.customerId,
+        request.recipient,
+        request.channel
+      );
+
+      if (!preference.enabled) {
+        // Channel is disabled by recipient preference -> Suppress notification!
+        // Notification record is created with status = 'suppressed'
+        // CRITICAL INVARIANT: Zero outbox events or queue jobs are created for suppressed requests.
+        const notification = await this.notificationRepo.create(client, {
+          customerId: request.customerId,
+          recipient: request.recipient,
+          channel: request.channel,
+          payload: request.payload,
+          status: "suppressed",
+        });
+
+        // Still write idempotency key to ensure future replays return identical suppression result
+        await this.idempotencyRepo.create(client, {
+          customerId: request.customerId,
+          idempotencyKey: idempotencyKey,
+          requestHash: requestHash,
+          notificationId: notification.id,
+        });
+
+        await client.query("COMMIT");
+
+        return {
+          status: 200,
+          isReplay: false,
+          isSuppressed: true,
+          body: {
+            id: notification.id,
+            customerId: notification.customer_id,
+            recipient: notification.recipient,
+            channel: notification.channel,
+            status: "suppressed",
+            suppressionReason: "recipient_preference_disabled",
+            createdAt: notification.created_at,
+          },
+        };
+      }
+
+      // Channel is enabled: Proceed with normal durable transactional outbox flow
       const notification = await this.notificationRepo.create(client, {
         customerId: request.customerId,
         recipient: request.recipient,
@@ -123,16 +187,20 @@ export class NotificationService {
                   existing.notification_id
                 );
                 await client2.query("COMMIT");
+                const isSuppressed = existingNotification.status === "suppressed";
                 return {
-                  status: 202,
+                  status: isSuppressed ? 200 : 202,
                   isReplay: true,
+                  isSuppressed,
                   body: {
                     id: existingNotification.id,
                     customerId: existingNotification.customer_id,
                     recipient: existingNotification.recipient,
                     channel: existingNotification.channel,
                     status: existingNotification.status,
+                    ...(isSuppressed ? { suppressionReason: "recipient_preference_disabled" } : {}),
                     createdAt: existingNotification.created_at,
+                    isReplay: true,
                   },
                 };
               } else {

@@ -82,13 +82,16 @@ router.post("/", async (req: Request, res: Response) => {
             if (rateLimit.member) {
               await rateLimiter.refund(customerId, rateLimit.member);
             }
-            return res.status(202).json({
+            const isSuppressed = existingNotification.status === "suppressed";
+            return res.status(isSuppressed ? 200 : 202).json({
               id: existingNotification.id,
               customerId: existingNotification.customer_id,
               recipient: existingNotification.recipient,
               channel: existingNotification.channel,
               status: existingNotification.status,
+              ...(isSuppressed ? { suppressionReason: "recipient_preference_disabled" } : {}),
               createdAt: existingNotification.created_at,
+              isReplay: true,
             });
           }
         } else {
@@ -126,7 +129,7 @@ router.post("/", async (req: Request, res: Response) => {
     }
 
     // 6. If this was a safe idempotent replay, refund the consumed token
-    if (result.status === 202 && result.isReplay && rateLimit.member) {
+    if ((result.status === 202 || result.status === 200) && result.isReplay && rateLimit.member) {
       await rateLimiter.refund(customerId, rateLimit.member);
     }
 

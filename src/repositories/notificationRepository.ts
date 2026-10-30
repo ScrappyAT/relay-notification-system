@@ -1,6 +1,11 @@
 import pg from "pg";
 import { pool } from "../database/pool.js";
 
+/**
+ * Pattern: Repository Pattern
+ * Purpose: Mediates between the domain service layer and PostgreSQL data mapping.
+ * Encapsulates SQL schema structure, constraints, and atomic row-level mutations for notifications.
+ */
 export class NotificationRepository {
   async create(client: pg.PoolClient, data: {
     customerId: string;

@@ -30,6 +30,12 @@ export interface AdmissionDecision {
   retryAfter?: number;
 }
 
+/**
+ * Pattern: State Machine Pattern
+ * Purpose: Formally models cluster operational readiness into discrete states (NORMAL, DEGRADED, OVERLOADED).
+ * Encapsulates well-defined transition rules driven by backlog thresholds, dependency probes, and circuit damping,
+ * governing admission control decisions and HTTP 503 fast-path rejections.
+ */
 export class BackpressureService {
   public enabled: boolean;
   public outboxDegradedThreshold: number;

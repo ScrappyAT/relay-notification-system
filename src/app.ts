@@ -2,6 +2,7 @@ import express from "express";
 import cors from "cors";
 import notificationsRouter from "./routes/notifications.js";
 import readyRouter from "./routes/ready.js";
+import preferencesRouter from "./routes/preferences.js";
 import { metricsMiddleware, getMetrics, register } from "./metrics/index.js";
 import { updateQueueMetrics } from "./metrics/queueMetrics.js";
 import { pool } from "./database/pool.js";
@@ -59,6 +60,7 @@ app.get("/metrics", async (_req, res) => {
 });
 
 app.use("/v1/notifications", notificationsRouter);
+app.use("/v1/recipients/preferences", preferencesRouter);
 
 app.use((_req, res) => {
   res.status(404).json({

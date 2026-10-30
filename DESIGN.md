@@ -16,7 +16,7 @@ Functional: async single notifications and campaigns; preferences, quiet hours, 
 
 TLS and bearer API key; store hashed secrets; key resolves tenant, scopes and environment. Never trust client-supplied customer_id. All reads/writes scoped to authenticated customer; cross-tenant resources return 404.
 - POST /v1/notifications -> 202 + ID, Location; required Idempotency-Key.
-- GET /v1/notifications/:id -> 200 + public status.
+- GET /v1/notifications/:id -> 200 + public status (Architectural contract specification; marked as future scope for API router, verified in prototype via PostgreSQL and tests).
 - POST /v1/campaigns -> 202; required idempotency key; audience upload reference.
 - GET /v1/campaigns/:id -> 200 + progress and counts_as_of.
 - PATCH /v1/recipients/:id/preferences -> 200; If-Match for sensitive updates.
@@ -34,6 +34,7 @@ Prototype database migrations ([`src/database/migrations/`](file:///c:/Users/HP/
 - `003_worker_leases.sql`: Worker atomic lease columns (`processing_started_at`, `processing_locked_until`, `claim_token`).
 - `004_outbox_failure_handling.sql`: Terminal failure columns on `outbox_events` (`failed_at`, `failure_reason`, `last_error`).
 - `005_notification_lifecycle.sql`: Extended lifecycle constraint adding `'processed'` to `notifications_status_check`.
+- `006_notification_preferences.sql`: Recipient preferences table (`recipient_preferences`) and status check expansion adding `'suppressed'`.
 
 ## 5. Architecture diagram
 
@@ -71,7 +72,7 @@ flowchart TD
         TX --> I
     end
     API -->|1. Commit TX & return 202| TX
-    
+
     subgraph OutboxEngine [Outbox Dispatcher Daemon]
         Poll[Poll Loop: SELECT ... FOR UPDATE SKIP LOCKED]
         Claim[Claim Lease: locked_until + attempts++]
@@ -79,7 +80,7 @@ flowchart TD
         Rel[Catch Error: releaseClaim locked_until=NULL]
         Pub[Success: SET published_at = NOW]
     end
-    
+
     O -.->|2. Claim unpublished| Poll
     Poll --> Claim
     Claim --> Push
@@ -87,12 +88,12 @@ flowchart TD
     Rel -.->|Eligible for next retry| O
     Push -->|Redis Restored| Pub
     Pub -.->|Mark published| O
-    
+
     subgraph QueueTransport [Redis / BullMQ - Disposable Transport]
         Q[(Channel Queue)]
     end
     Push -->|Job ID: notif-ID| Q
-    
+
     subgraph WorkerFleet [Worker Service]
         W[Channel Worker]
         WClaim[Atomic DB Lease & Status: processing]
@@ -114,11 +115,11 @@ flowchart TD
 #### 2. Outbox Dispatcher Claiming & Lease Protocol
 - **Non-blocking Polling:** The background dispatcher daemon polls `outbox_events` periodically (default: 1000ms) using PostgreSQL row-level locks:
   ```sql
-  SELECT id FROM outbox_events 
-  WHERE published_at IS NULL 
+  SELECT id FROM outbox_events
+  WHERE published_at IS NULL
     AND (locked_until IS NULL OR locked_until < NOW())
-  ORDER BY created_at ASC 
-  FOR UPDATE SKIP LOCKED 
+  ORDER BY created_at ASC
+  FOR UPDATE SKIP LOCKED
   LIMIT 10;
   ```
 - **Concurrency & Leases:** Claimed events have their `attempts` counter incremented and `locked_until` set to `NOW() + leaseDurationSeconds` (default: 60s) along with a unique `claim_token`. Multiple dispatcher instances can run concurrently without race conditions or double claims.
@@ -127,8 +128,8 @@ flowchart TD
 - **Connection Error Handling:** The dispatcher utilizes `ioredis` configured with `maxRetriesPerRequest: null` (required by BullMQ) and event logging.
 - **Immediate Lease Reset:** When `queue.add()` fails due to an unreachable Redis host (`ECONNREFUSED` or timeout), the dispatcher traps the exception in its retry loop and executes:
   ```sql
-  UPDATE outbox_events 
-  SET locked_until = NULL 
+  UPDATE outbox_events
+  SET locked_until = NULL
   WHERE id = $1 AND published_at IS NULL AND failed_at IS NULL;
   ```
 - **Zero-Stall Recovery:** By explicitly resetting `locked_until` to `NULL` upon failure instead of waiting for the 60-second lease to expire, events become immediately eligible for re-dispatch as soon as Redis connectivity is re-established.
@@ -145,15 +146,66 @@ flowchart TD
 #### 6. Terminal Failure Handling & Dead-Lettering
 - **Threshold Limit:** If an outbox event encounters persistent errors and exceeds `maxAttempts` (default: 10), it is marked terminal:
   ```sql
-  UPDATE outbox_events 
+  UPDATE outbox_events
   SET failed_at = NOW(), failure_reason = $2, locked_until = NULL, last_error = $2
   WHERE id = $1 AND published_at IS NULL AND failed_at IS NULL;
   ```
 - **Auditable Safety:** Terminally failed outbox records are excluded from active polling (`idx_outbox_exhausted`), preventing poison-pill blocking while preserving complete forensic audit trails in PostgreSQL.
 
-## 7. Deep dive: provider uncertainty
+## 7. Deep dive: provider uncertainty and failure handling (Milestone 7B)
 
-Check preferences and suppression at send time. Record attempt before provider call. States distinguish accepted, provider_accepted, delivered, failed, expired, suppressed and outcome_unknown. Timeout is unknown, not failed. With provider idempotency retry same key within documented window; with status lookup reconcile by client reference; otherwise choose policy by category: critical bounded retry/fallback, marketing prioritize no duplicates, transactional cautious. OTP retries use same unexpired challenge. Late callbacks update status with immutable audit history.
+### 7.1 Architecture Overview
+External communications providers (e.g., SendGrid, AWS SES, Twilio, Sinch) operate across public networks and introduce inherent operational uncertainties: transient outages (HTTP 503), tenant quota exhaustion (HTTP 429), unroutable destinations (HTTP 400), and socket timeouts (HTTP 504).
+
+Relay addresses provider uncertainty through an decoupled adapter layer ([`src/adapters/simulatedProvider.ts`](file:///c:/Users/HP/Desktop/relay-system/src/adapters/simulatedProvider.ts)), bounded exponential queue retries via BullMQ, PostgreSQL lease safety, and a strict notification lifecycle state machine.
+
+```mermaid
+stateDiagram-v2
+    [*] --> pending: HTTP 202 Ingested (Atomic Outbox Commit)
+    pending --> suppressed: Recipient Preference Disabled (HTTP 200)
+    pending --> queued: Outbox Dispatcher Enqueued to BullMQ
+    queued --> processing: Worker Claims Atomic Lease (60s Claim Token)
+
+    processing --> provider_accepted: HTTP 200/202 Provider Accepted
+    processing --> processing: HTTP 503/429 Transient Failure (Lease Released, BullMQ Backoff)
+    processing --> failed: HTTP 400 Permanent Rejection (UnrecoverableError, No Retries)
+    processing --> failed: Max Retries Exhausted (attempts >= 5)
+    processing --> outcome_unknown: Socket Timeout (Indeterminate Outcome, Avert Blind Retry)
+
+    provider_accepted --> [*]
+    suppressed --> [*]
+    failed --> [*]
+    outcome_unknown --> [*]: Manual / Reconciliation Review
+```
+
+### 7.2 Provider Failure Taxonomy & Worker Execution Policies
+
+| Failure Mode | HTTP Status | Retryable | DB Transition | BullMQ Worker Action | Justification |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Successful Acceptance** | `202 Accepted` / `200 OK` | N/A | `processing` → `provider_accepted` | Record metrics, clear lease, complete job | Provider confirmed receipt; message handed off to carrier/MTA. |
+| **Temporary Provider Outage** | `503 Service Unavailable` | Yes | Lease released (`processing_locked_until = NULL`, `retry_count++`) | Throw `ProviderError` for exponential backoff | Downstream gateway experiencing transient disruption; safe to retry after cooldown. |
+| **Provider Rate Limiting** | `429 Too Many Requests` | Yes | Lease released (`processing_locked_until = NULL`, `retry_count++`) | Throw `ProviderError` for exponential backoff | Account dispatch quota exceeded; backoff prevents cascading provider bans. |
+| **Network Socket Timeout** | `504 Gateway Timeout` | Indeterminate | `processing` → `outcome_unknown` | Throw `UnrecoverableError` to abort blind retries | Request dispatched over network but socket severed before ACK; duplicate send could double-deliver. |
+| **Permanent Client/Payload Rejection** | `400 Bad Request` | No | `processing` → `failed` | Throw `UnrecoverableError` immediately | Invalid destination address, unroutable prefix, or schema error; retrying will never succeed. |
+| **Retry Limit Exhaustion** | Any | No | `processing` → `failed` | Throw error to fail BullMQ job | Exceeded maximum configured attempts (`job.opts.attempts = 5`); prevents infinite queue loops. |
+
+### 7.3 Lease Protocol & Idempotency Invariants
+1. **Atomic Claim Token:** Before invoking the provider adapter, workers claim the notification in PostgreSQL using a timed lease:
+   ```sql
+   UPDATE notifications
+   SET status = 'processing',
+       processing_started_at = COALESCE(processing_started_at, NOW()),
+       processing_locked_until = NOW() + INTERVAL '60 seconds',
+       claim_token = $3,
+       updated_at = NOW()
+   WHERE id = $1
+     AND (status IN ('pending', 'queued') OR (status = 'processing' AND (processing_locked_until IS NULL OR processing_locked_until < NOW())))
+     AND (processing_locked_until IS NULL OR processing_locked_until < NOW() OR claim_token IS NULL)
+   RETURNING *;
+   ```
+2. **Dynamic Lease Release on Backoff:** During transient 503 or 429 failures, the worker explicitly clears `processing_locked_until = NULL` and `claim_token = NULL` before throwing the error. When BullMQ's exponential delay fires (e.g. 2s, 4s, 8s), the subsequent attempt re-claims the notification cleanly.
+3. **Defense Against Duplicate Provider Calls:** If a delayed or duplicate BullMQ job executes for a notification already in a terminal state (`provider_accepted`, `processed`, `failed`, `outcome_unknown`, `suppressed`), the worker detects the terminal status upon row claim inspection and skips execution immediately without invoking the external provider adapter.
+4. **Preference Suppression Integration:** If a recipient has opted out of a channel (`recipient_preferences.enabled = false`), the API marks the notification `status: 'suppressed'` at ingestion and creates zero outbox events, guaranteeing that suppressed requests never reach Redis queues, workers, or provider adapters.
 
 ## 8. Deep dive: queues, fairness, backpressure
 
@@ -181,8 +233,64 @@ Redis outage -> outbox retry; dispatcher crash after enqueue -> dedup/claim; wor
 ## 12. Tradeoffs, costs and validation
 
 Tradeoffs: outbox reliability vs writes; at-least-once vs duplicate risk; priority queues vs complexity; gradual expansion vs campaign latency; partition retention vs global uniqueness; tenant sharding vs routing overhead; fake providers vs real-world fidelity.
-**Cost estimate at 100k users: OPEN — do not invent prices.** Define monthly notifications/user, channel mix, destination geography, retention and egress; price API/worker compute, Postgres+backups, Redis, storage, observability, email/SMS/WhatsApp and any push fees. Insert dated official pricing references and low/base/high calculations before submission.
-Validation: unit+integration tests, k6 throughput/p50/p95/p99/errors/queue age at documented prototype load, Redis failure drill, provider ambiguity drill, 20-minute walkthrough (requirements 3m, architecture 4m, API/data/patterns 4m, demo 5m, tests/failure 3m, tradeoffs 1m), mock interview with three hard questions. All results pending implementation.
+
+### 12.3 Monthly Infrastructure Cost Model (100,000 Users — Milestone 7D)
+Relay's monthly operating costs were rigorously modeled for a deployment of **100,000 registered end-user recipients** across 100 business tenants, using official provider pricing pages verified on **30 October 2026** ([`benchmarks/COST-MODEL.md`](file:///c:/Users/HP/Desktop/relay-system/benchmarks/COST-MODEL.md)).
+
+#### Workload Dimensions & Assumptions
+- **User Population:** 100,000 registered recipients in `recipient_preferences`.
+- **Storage & Retention:** Rolling 30-day live database window (~2.0 KB per notification transaction across `notifications`, `outbox_events`, `idempotency_keys`, and B-Tree indexes).
+- **Transport Buffer:** Transitory Redis queue buffer (< 100 MB active footprint).
+- **Channel Partition:** Multi-channel distribution spanning Email and SMS.
+
+#### Verified Official Provider Pricing (Checked 30 October 2026)
+- **API Compute:** Render Web Service Standard (1 vCPU, 2 GB RAM) — **$25.00 / month** ([render.com/pricing](https://render.com/pricing)).
+- **Worker Fleet:** Render Background Worker Standard (1 vCPU, 2 GB RAM) — **$25.00 / month** ([render.com/pricing](https://render.com/pricing)).
+- **PostgreSQL Database:** Neon Serverless PostgreSQL Launch Plan — **$0.106 / CU-hour** compute, **$0.35 / GB-month** storage ([neon.tech/pricing](https://neon.tech/pricing)).
+- **Redis Queue / Cache:** Render Key Value Standard (1 GB RAM, disk persistence) — **$20.00 / month** ([render.com/pricing](https://render.com/pricing)).
+- **Email Delivery:** Amazon SES Outbound — **$0.10 per 1,000 emails** ($0.0001/email) ([aws.amazon.com/ses/pricing](https://aws.amazon.com/ses/pricing/)).
+- **SMS Delivery:** Twilio US Outbound — **$0.0125 per segment** ($0.0083 base + ~$0.0042 carrier pass-through) + **$1.15/mo** 10DLC number + **$1.50/mo** campaign fee ([twilio.com/en-us/sms/pricing/us](https://www.twilio.com/en-us/sms/pricing/us)).
+- **Observability:** Grafana Cloud Pro Tier — **$19.00 / month** base + $0.45/GB logs ([grafana.com/pricing](https://grafana.com/pricing/)).
+- **Database Backups:** Amazon S3 Standard — **$0.023 / GB-month** ([aws.amazon.com/s3/pricing](https://aws.amazon.com/s3/pricing/)).
+
+#### Three Monthly Cost Scenarios (100,000 Users)
+| Scenario | Active Ratio (MAU) | Monthly Volume | Channel Mix (Email / SMS) | Server Infra | Third-Party Telecom | Total Monthly Cost | Cost / 1k Notifs |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Scenario A (Low)** | 30% (30k MAU) | 60,000 / mo (2/user) | 85% Email / 15% SMS | $43.38 | $120.25 | **$163.63** | **$2.73** |
+| **Scenario B (Expected)** | 60% (60k MAU) | 300,000 / mo (5/user) | 80% Email / 20% SMS | $136.19 | $776.65 | **$912.84** | **$3.04** |
+| **Scenario C (High)** | 85% (85k MAU) | 1,700,000 / mo (20/user) | 75% Email / 25% SMS | $369.46 | $5,452.30 | **$5,821.76** | **$3.42** |
+
+*(Note on Classification: Under a strict fixed baseline subscription vs. volume-variable consumption model, Scenario B divides into **$130.69 fixed subscriptions** [compute, baseline DB, Redis, Grafana base, phone numbers, 10DLC campaign] and **$782.15 variable usage** [SES emails, SMS segments, storage, logs, egress], totaling **$912.84**).*
+
+#### Critical Cost Takeaways & Capacity Sufficiency
+1. **SMS Dominance:** Telecommunications carrier fees for SMS dwarf compute infrastructure, accounting for **85.1%** of monthly expenditure in Scenario B ($776.65 of $912.84) and **93.7%** in Scenario C. Sending 1,000 SMS ($12.50) is **125x more expensive** than sending 1,000 emails ($0.10 via SES).
+2. **Safeguard Value:** This disparity proves that **Tenant Rate Limiting (Milestone 6B)** and **Recipient Preference Suppression (Milestone 7A)** are vital financial controls that protect tenant budgets from runaway billing.
+3. **Capacity Sufficiency:** Based on empirical Milestone 7C benchmarks (where Relay sustained 1.70 req/s baseline against remote Neon), single-instance configurations are fully sufficient for Scenarios A (0.23 req/s peak) and B (1.16 req/s peak). Scenario C (6.56 req/s peak) exceeds single-node connection pool capacity and requires 2 horizontal API pods and connection pooling (PgBouncer); this multi-node topology is mathematically budgeted but has not been tested in the single-node prototype.
+4. **100k Users vs. 50M/Day Target:** Conflating this 100k-user model ($912/mo for 300k notifs) with the 50M/day target (1.5B notifs/mo) is invalid. The 50M/day design target is 5,000x larger in volume and requires a fundamentally different architecture: multi-tenant PostgreSQL sharding, distributed streaming brokers (Kafka/Pulsar), and enterprise aggregator agreements.
+
+### 12.1 Empirical k6 Load Testing (Milestone 7C)
+Relay was evaluated using Grafana k6 v0.54.0 against the live API, remote Neon cloud PostgreSQL, and local Redis across three controlled traffic profiles ([`benchmarks/k6/REPORT.md`](file:///c:/Users/HP/Desktop/relay-system/benchmarks/k6/REPORT.md)):
+
+| Profile | Concurrency | Total Req | Total HTTP Throughput | Accepted Throughput | Latency p50 (All / Accepted) | Latency p95 (All / Accepted) | Ingress Outcomes |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Scenario A: Baseline** | 3 VUs (20s) | 36 | 1.70 req/s | 1.70 accepted/s | 1,156 ms / 1,156 ms | 2,759 ms / 2,762 ms | 36 Accepted (HTTP 202, 100.0%), 0 errors |
+| **Scenario B: Gradual Ramp-Up** | 2 → 35 VUs (50s) | 1,490 | 28.33 req/s | 4.13 accepted/s | 3.91 ms / 1,448 ms | 2,335 ms / 3,059 ms | 217 Accepted (202), 17 Suppressed (200), 890 Rate-Limited (429), 352 Overload Defense (503), 14 client timeouts (0.94%) |
+| **Scenario C: Short Spike** | 5 → 30 VUs (30s) | 727 | 23.34 req/s | 3.30 accepted/s | 204 ms / 1,227 ms | 1,315 ms / 2,151 ms | 103 Accepted (202), 9 Suppressed (200), 615 Overload Defense (503), 0 crashes |
+
+### 12.2 Architectural Analysis: Prototype vs. 50M/Day Target
+- **Design Target:** 50,000,000 notifications / day = **579 req/s sustained**, **5,787 req/s peak (10x)**.
+- **Measured Prototype Throughput:** Peak total HTTP throughput of **28.33 req/s** (evaluating fast defenses); measured sustained durable acceptance of **3.30–4.13 accepted notifications/s** under multi-VU concurrency.
+- **Explanation of Gap:**
+  1. *Remote Cloud Database Latency:* The prototype connects to an AWS Neon PostgreSQL instance in London over public TLS. Each transaction involves 4 round-trips (`BEGIN` → `SELECT customer & idempotency` → `INSERT notification, outbox, idempotency` → `COMMIT`). Network RTT (~80–150ms per round-trip from the local client) sets an unavoidable physical floor of ~1,000–1,400ms per database transaction.
+  2. *Connection Pool Sizing & Theoretical Ceiling:* The prototype connection pool is configured to `DB_POOL_MAX = 15` ([`src/config/env.ts`](file:///c:/Users/HP/Desktop/relay-system/src/config/env.ts)) to stay safely within Neon serverless free-tier concurrency limits. Under single-node operation:
+     $$\text{Theoretical Ingress Ceiling (Estimate)} = \frac{15 \text{ connections}}{1.0\text{–}1.4 \text{ s/transaction}} \approx 10.7\text{–}15.0 \text{ req/s}$$
+     Under multi-VU concurrency, connection checkout serialization, lock contention, and worker background operations reduce measured sustained acceptance throughput to **3.30–4.13 accepted/sec**.
+  3. *Single Node Topology:* The prototype runs a single Express Node.js process and a single PostgreSQL primary without read replicas, horizontal API pods, or connection multiplexers (e.g. PgBouncer).
+- **Protection Validation:** Under saturation (35 VUs in Ramp-Up, 30 VUs in Spike), Relay's defensive mechanisms operated flawlessly:
+  - Redis Lua rate limiting rejected excess tenant traffic in **3.91 ms (p50)**, protecting PostgreSQL from unnecessary queries.
+  - Backpressure admission control rejected overload traffic in **< 10 ms** with `HTTP 503 SYSTEM_OVERLOADED` and `Retry-After: 5`, preventing database pool starvation or unhandled 500 crashes.
+  - During maximum contention at 35 VUs, 14 requests experienced client-side TCP timeouts (15s k6 timeout) in the pool checkout queue; zero server crashes or 500 errors occurred.
+  - Upon load reduction, the system recovered within 1.5 seconds without administrator intervention.
 
 ## 13. Observability & Operational Metrics Architecture
 
@@ -271,7 +379,7 @@ Relay executes its core services as independent Node.js processes. Metrics colle
 
 ### 13.7 Supporting 50-Million-Per-Day Target Capacity
 - **Design Target:** 50M notifications/day requires 579/s sustained throughput and 5,787/s peak capacity.
-- **Bottleneck Detection:** 
+- **Bottleneck Detection:**
   - `relay_api_request_duration_seconds` detects API saturation under peak ingress.
   - `relay_dispatcher_outbox_awaiting_publication` and publication duration histograms detect dispatcher backlog formation.
   - `relay_queue_jobs_waiting` and `relay_worker_active_jobs` detect worker pool exhaustion.
@@ -300,16 +408,16 @@ Key principles:
 flowchart TD
     Client["Client Request (POST /v1/notifications)"] --> ExtractTenant["Validate Body & Extract customerId"]
     ExtractTenant --> RLCheck{"RateLimiter.consume(customerId)"}
-    
+
     subgraph RedisEvaluation["Atomic Redis Lua (Sliding Window Log)"]
         RLCheck -->|Redis Available| LuaScript["Lua Script: ZREMRANGEBYSCORE + ZCARD + ZADD"]
         RLCheck -->|Timeout / Redis Error| FailOpen["Fail-Open (Log throttled warning & record metric)"]
     end
-    
+
     FailOpen --> AllowIngress["Allow Durable Ingestion"]
     LuaScript -->|current >= limit| Return429["Return HTTP 429 Too Many Requests\n(RateLimit-* and Retry-After headers)"]
     LuaScript -->|current < limit| AllowIngress
-    
+
     AllowIngress --> DBTx["PostgreSQL Transaction (notifications + outbox_events)"]
     DBTx --> ReplayCheck{"Is Safe Idempotent Replay?"}
     ReplayCheck -->|Yes (Identical Payload)| RefundToken["RateLimiter.refund(member)\n(ZREM member from Redis ZSET)"]
@@ -375,7 +483,7 @@ Relay balances DDoS protection against idempotency fairness:
 3. **Conflicting Replay Penalty:** If a request attempts to reuse an existing idempotency key with a differing payload (HTTP 409 Conflict), **no refund is issued**. Conflicting replays represent invalid client behavior that consumed server compute and must remain bounded by rate limits.
 
 ### 14.6 Redis Failure Policy: Fail-Open for Durable Acceptance
-Relay's primary durability promise is that notifications are committed to PostgreSQL (`notifications` and `outbox_events`) inside a single ACID transaction before queueing to Redis. 
+Relay's primary durability promise is that notifications are committed to PostgreSQL (`notifications` and `outbox_events`) inside a single ACID transaction before queueing to Redis.
 
 Therefore, Redis unavailability must never block ingestion:
 - **Fail-Open Policy:** If Redis is down, disconnected, or fails during script execution, the rate limiter catches the error and immediately fails open (`allowed: true, failOpen: true`), returning `HTTP 202 Accepted` and recording the notification in PostgreSQL.
@@ -453,21 +561,21 @@ Head-of-line blocking begins in the database. If the Dispatcher claims outbox ev
 
 Relay solves this at the database layer using PostgreSQL SQL Window Functions:
 ```sql
-UPDATE outbox_events 
-SET claimed_at = COALESCE(claimed_at, NOW()), 
+UPDATE outbox_events
+SET claimed_at = COALESCE(claimed_at, NOW()),
     locked_until = $2,
     attempts = attempts + 1
 WHERE id IN (
   SELECT sub.id FROM (
     SELECT oe.id,
            ROW_NUMBER() OVER (
-             PARTITION BY n.customer_id 
+             PARTITION BY n.customer_id
              ORDER BY oe.created_at ASC
            ) as tenant_turn,
            oe.created_at
     FROM outbox_events oe
     JOIN notifications n ON oe.notification_id = n.id
-    WHERE oe.published_at IS NULL 
+    WHERE oe.published_at IS NULL
       AND oe.failed_at IS NULL
       AND (oe.locked_until IS NULL OR oe.locked_until < NOW())
   ) sub
@@ -536,7 +644,7 @@ Relay enforces a strict **fail-open policy** on fairness controls:
 ### 15.6 Capacity & Scaling for 50M Notifications/Day
 - **Outbox Indexing Strategy:** At 50M/day, `outbox_events` requires composite partial indexing:
   ```sql
-  CREATE INDEX idx_outbox_fairness ON outbox_events (created_at ASC) 
+  CREATE INDEX idx_outbox_fairness ON outbox_events (created_at ASC)
   WHERE published_at IS NULL AND failed_at IS NULL;
   ```
 - **Partitioned Scalability:** With database partitioning by `created_at` (daily partitions), unpublished outbox scans remain bounded to the active partition.
@@ -680,7 +788,81 @@ $$\text{Overshoot}_{\text{max}} = R_{\text{ingress}} \times T_{\text{cache\_ttl}
 - **Prototype Workload:** At prototype ingress rates of 5–50 req/s, the maximum potential overshoot is bounded to 5–50 notifications before the next state refresh transitions the engine to `OVERLOADED`.
 - **Operational Safety:** This small transient overshoot is fully absorbed by PostgreSQL's durable transactional outbox without performance degradation or data loss. Without state caching, executing a database count on every incoming request would saturate the connection pool and trigger cascading failures under heavy load.
 
+---
 
+## 17. Recipient Notification Preferences Architecture (Milestone 7A)
 
+### 17.1 Architectural Objectives & Isolation
+Milestone 7A implements recipient notification preferences to ensure recipients have granular opt-in/opt-out control over communication channels (`email`, `sms`) while maintaining strict multi-tenant isolation, durable auditability, and deterministic idempotency.
 
+Key Invariants:
+1. **Tenant Isolation:** Preferences are strictly partitioned by `(customer_id, recipient, channel)`. Disabling an email address under Tenant A has zero effect on Tenant B.
+2. **Transaction Consistency & Point of Authority:** Preference evaluation executes within the **active PostgreSQL transaction** during notification creation. The preference decision at commit time is authoritative.
+3. **Zero Outbox Leakage:** Suppressed notifications generate zero rows in `outbox_events` and zero jobs in BullMQ queues.
+4. **Deterministic Idempotency:** If a notification request is suppressed, repeated submissions with the identical idempotency key and payload deterministically return the original suppression response, even if the recipient subsequently re-enables the channel.
 
+### 17.2 Data Model (`recipient_preferences`)
+Created in migration [`006_notification_preferences.sql`](file:///c:/Users/HP/Desktop/relay-system/src/database/migrations/006_notification_preferences.sql):
+
+```sql
+CREATE TABLE recipient_preferences (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    customer_id UUID NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+    recipient VARCHAR(255) NOT NULL,
+    channel VARCHAR(20) NOT NULL CHECK (channel IN ('email', 'sms')),
+    enabled BOOLEAN NOT NULL DEFAULT true,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_recipient_channel_per_customer UNIQUE (customer_id, recipient, channel)
+);
+
+CREATE INDEX idx_recipient_preferences_lookup
+ON recipient_preferences(customer_id, recipient, channel);
+```
+
+### 17.3 Ingestion Lifecycle with Preference Evaluation
+
+```mermaid
+flowchart TD
+    Client([HTTP Client]) -->|POST /v1/notifications| API[Relay API Router]
+    API --> RateLimit{Rate Limit OK?}
+    RateLimit -->|No| R429[HTTP 429 RATE_LIMIT_EXCEEDED]
+    RateLimit -->|Yes| Admission{Admission OK?}
+    Admission -->|No| R503[HTTP 503 SYSTEM_OVERLOADED]
+    Admission -->|Yes| TX[Begin PostgreSQL Transaction]
+
+    TX --> IdemCheck{Idempotency Key Exists?}
+    IdemCheck -->|Yes & Match| Replay[Return Existing 200/202 isReplay=true]
+    IdemCheck -->|Yes & Mismatch| R409[HTTP 409 IDEMPOTENCY_CONFLICT]
+
+    IdemCheck -->|No| PrefCheck{Check Preference in DB}
+    PrefCheck -->|Found enabled=false| SuppressFlow[Create Notification status=suppressed\nZero Outbox Events\nCreate Idempotency Key\nCommit TX]
+    SuppressFlow --> Ret200[HTTP 200 OK status=suppressed]
+
+    PrefCheck -->|Not found or enabled=true| AcceptFlow[Create Notification status=pending\nCreate Outbox Event\nCreate Idempotency Key\nCommit TX]
+    AcceptFlow --> Ret202[HTTP 202 Accepted status=pending]
+```
+
+### 17.4 Suppression Response Contract vs. Acceptance Contract
+Relay provides an unambiguous HTTP API contract distinguishing accepted queue jobs from suppressed requests:
+
+| Scenario | HTTP Status | Response Contract | Outbox / BullMQ |
+| :--- | :--- | :--- | :--- |
+| **Accepted Notification** | `202 Accepted` | `{"id":"...","status":"pending","channel":"email",...}` | Event written; published to queue |
+| **Suppressed Notification** | `200 OK` | `{"id":"...","status":"suppressed","suppressionReason":"recipient_preference_disabled",...}` | Zero outbox writes; never queued |
+| **Idempotent Replay (Accepted)** | `202 Accepted` | `{"id":"...","status":"pending","isReplay":true,...}` | No new outbox event; token refunded |
+| **Idempotent Replay (Suppressed)** | `200 OK` | `{"id":"...","status":"suppressed","isReplay":true,...}` | No new outbox event; token refunded |
+| **Idempotency Conflict** | `409 Conflict` | `{"code":"IDEMPOTENCY_CONFLICT","message":"..."}` | Rolled back |
+
+### 17.5 Default-Allow Policy vs. Legal Consent
+The prototype adopts an explicit **default-allow** policy: if a recipient has no recorded preference for a channel under a customer, notifications are permitted.
+
+> [!WARNING]
+> **Legal Disclaimer:** Default-allow is an engineering prototype convention implemented for test convenience. It is **not** a substitute for legally mandated marketing consent (e.g. GDPR, CAN-SPAM, TCPA), which requires verifiable, affirmative opt-in consent prior to marketing transmissions.
+
+### 17.6 Preference Management API
+- `PUT /v1/recipients/preferences`: Upserts channel preferences for a given tenant recipient.
+- `GET /v1/recipients/preferences`: Retrieves saved preferences or returns default state (`isDefault: true`).
+
+> [!NOTE]
+> **Prototype Authentication Boundary:** Like `/v1/notifications`, the preference endpoints currently rely on `customerId` supplied in the request body/query for prototype demonstration. Production deployments must extract and cryptographically verify tenant identity from authenticated API keys or JWT tokens.

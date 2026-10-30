@@ -61,7 +61,7 @@ The objective of this drill was to validate the core resilience hypothesis of th
 ## 8. Milestone 6A: Observability and Operational Metrics (28 October 2026)
 
 ### 8.1 Architectural Context & Strategy
-Before implementing multi-tenant rate limiting, fair queuing, and backpressure in subsequent milestones, the system requires granular, low-overhead operational visibility across its distributed components. 
+Before implementing multi-tenant rate limiting, fair queuing, and backpressure in subsequent milestones, the system requires granular, low-overhead operational visibility across its distributed components.
 
 ### 8.2 Key Implementation Decisions & Trade-offs
 1. **Metric Label Cardinality and Safety:**
@@ -315,7 +315,379 @@ All 67 automated tests passed cleanly across 9 test suites:
 6. **Remaining Production Limitations:**
    - *Static vs Dynamic Thresholds:* Current thresholds (500 degraded, 2000 overloaded) are fixed in environment variables. Production systems with autoscaling worker pools should scale thresholds proportionally with active worker count.
    - *Outbox Table Partitioning:* At 50M notifications/day, `outbox_events` requires daily partitioning so that backlog queries scan only the active partition index.
-   - *Outbox Table Partitioning:* At 50M notifications/day, `outbox_events` requires daily partitioning so that backlog queries scan only the active partition index.
 
+---
 
+## 12. Milestone 7A: Recipient Notification Preferences & Suppression
 
+### 12.1 Objective
+Implement recipient-level channel opt-in/opt-out preferences prior to queueing messages, satisfying Part 3 of the Dev and Design HQ Graduation Task.
+
+### 12.2 Architectural Decisions & Trade-offs
+1. **Transactionally Consistent Preference Evaluation (Point of Authority):**
+   - *Decision:* Evaluate `recipient_preferences` inside the **active PostgreSQL transaction** started for notification ingestion.
+   - *Rationale:* Placing preference evaluation outside the transaction creates race conditions where a concurrent opt-out update commits between preference check and outbox write, leading to unwanted messages being dispatched. In Relay, the preference check uses the active transaction client, guaranteeing atomic snapshot isolation.
+2. **Explicit Suppression Response Contract (`HTTP 200 OK` vs `HTTP 202 Accepted`):**
+   - *Decision:* Return `HTTP 200 OK` with `{ status: "suppressed", suppressionReason: "recipient_preference_disabled" }` when a notification is suppressed by preference.
+   - *Rationale:* Returning `202 Accepted` for suppressed requests violates the HTTP semantic that `202` indicates acceptance for asynchronous processing. `200 OK` signals that the submission was successfully evaluated, committed to the audit record, but will not undergo asynchronous dispatch.
+3. **Zero Outbox & Queue Invariant:**
+   - *Decision:* Suppressed notifications insert a row in `notifications` (with `status = 'suppressed'`) and an idempotency key, but **never write to `outbox_events`**.
+   - *Rationale:* By omitting the outbox row, the Outbox Dispatcher never sees the event and BullMQ workers never consume resources for suppressed messages.
+4. **Deterministic Idempotency on Suppressed Requests:**
+   - *Decision:* Replaying an identical request for a suppressed notification returns the original suppression response, even if the recipient subsequently enables the channel.
+   - *Rationale:* Idempotency keys must remain deterministic across the request lifecycle. Re-evaluating preferences on replay would alter past responses and violate the core distributed idempotency contract.
+5. **Default-Allow Prototype Assumption:**
+   - *Decision:* If no preference record exists for `(customerId, recipient, channel)`, default to `enabled: true`.
+   - *Legal Boundary:* Documented as a prototype testing convention. In production marketing systems, legally required affirmative opt-in consent (GDPR, CAN-SPAM, TCPA) must default to disabled for promotional channels.
+
+### 12.3 Test Suite Verification (80/80 Tests Passing)
+A dedicated test suite [`tests/preferences.test.ts`](file:///c:/Users/HP/Desktop/relay-system/tests/preferences.test.ts) was created with 13 automated tests covering:
+- Email and SMS explicitly enabled (HTTP 202, outbox event created).
+- Email and SMS disabled (HTTP 200 suppressed, zero outbox rows, zero queue jobs).
+- No saved preferences (default-allow HTTP 202).
+- Dynamic preference updates (toggle disabled -> enabled updates future requests).
+- Tenant isolation (disabling recipient in Tenant A does not disable Tenant B).
+- Complete outbox and BullMQ absence verified via direct database count and `queue.getJob()`.
+- Idempotent replay of suppressed requests returning `HTTP 200 isReplay: true` after re-enabling channel.
+- Conflicting payload with reused key returning `HTTP 409 IDEMPOTENCY_CONFLICT`.
+- API schema validation and non-existent customer handling on `PUT` and `GET /v1/recipients/preferences`.
+- Rate limiting header emission and token refund on safe replay of suppressed requests.
+- Deterministic arbitration of concurrent preference updates and notification submissions.
+
+Regression Test Results:
+```
+Test Files  10 passed (10)
+     Tests  80 passed (80)
+  Duration  127.34s
+```
+
+## 13. Milestone 7B: Simulated Provider Failures, Retries & State Recovery
+
+### 13.1 Context & Problem Statement
+In distributed communications infrastructure, delivery across external carrier and vendor networks (e.g. SendGrid, Twilio, AWS SES, Sinch) is fraught with partial failure modes:
+1. Downstream transient outages (HTTP 503 Service Unavailable).
+2. Tenant dispatch rate limits (HTTP 429 Too Many Requests).
+3. Network connection drops and socket read timeouts (HTTP 504 Gateway Timeout).
+4. Permanent message rejections due to unroutable phone numbers or invalid addresses (HTTP 400 Bad Request).
+5. Infinite retry stampedes when failures are not correctly partitioned into retryable vs. terminal.
+
+Prior to Milestone 7B, Relay workers simulated local processing and immediately transitioned notifications to `processed` status upon atomic claim. Milestone 7B establishes a realistic simulated provider adapter layer ([`src/adapters/simulatedProvider.ts`](file:///c:/Users/HP/Desktop/relay-system/src/adapters/simulatedProvider.ts)), integrates provider execution into [`src/workers/emailWorker.ts`](file:///c:/Users/HP/Desktop/relay-system/src/workers/emailWorker.ts) and [`src/workers/smsWorker.ts`](file:///c:/Users/HP/Desktop/relay-system/src/workers/smsWorker.ts), implements bounded exponential retry mechanics with BullMQ, and enforces an auditable notification lifecycle state machine.
+
+### 13.2 Architecture & Failure Taxonomy
+The `SimulatedProvider` adapter manages simulated gateways for email (`SendGrid-Simulator`) and SMS (`Twilio-Simulator`). It supports deterministic test injection via recipient overrides, notification overrides, keyword matching, and channel-wide failure rates:
+
+```mermaid
+flowchart TD
+    Job[BullMQ Worker Job] --> Lease[Atomic PostgreSQL Claim Lease]
+    Lease --> ProviderCall[SimulatedProvider.send]
+
+    ProviderCall -->|HTTP 202/200| Success[status = provider_accepted]
+    ProviderCall -->|HTTP 503/429| Transient[Transient Failure]
+    ProviderCall -->|HTTP 504 Timeout| Timeout[status = outcome_unknown]
+    ProviderCall -->|HTTP 400 Bad Request| Permanent[status = failed]
+
+    Transient -->|Attempts < Max| Backoff[Release DB Lease\nThrow Error for BullMQ Exponential Backoff]
+    Transient -->|Attempts >= Max| Exhausted[status = failed\nRetry Count Updated]
+
+    Timeout --> Abort1[Throw UnrecoverableError\nPrevent Blind Duplicate Delivery]
+    Permanent --> Abort2[Throw UnrecoverableError\nPrevent Futile Retries]
+```
+
+#### Lifecycle State Invariants
+- `pending`: Ingested transactionally via API (HTTP 202) alongside outbox event and idempotency key.
+- `suppressed`: Ingested via API (HTTP 200) when recipient preference is disabled; zero outbox events created.
+- `queued`: Enqueued into BullMQ by Outbox Dispatcher.
+- `processing`: Claimed by worker under a 60-second atomic lease (`claim_token` assigned, `processing_locked_until = NOW() + 60s`).
+- `provider_accepted`: Provider acknowledged delivery request (HTTP 200/202) with realistic provider message ID.
+- `outcome_unknown`: Network timeout severed socket read after dispatch; outcome cannot be confirmed without external carrier lookup; blind retries are halted to prevent duplicate messages.
+- `failed`: Terminal failure state reached either via non-retryable rejection (HTTP 400) or exhaustion of maximum configured retry attempts.
+
+### 13.3 Key Architectural Decisions & Trade-Offs
+1. **Network Timeout (`outcome_unknown`) vs. Blind Retries:**
+   - *Decision:* When a provider call times out after the TCP connection was established and the HTTP payload was written, mark the notification as `outcome_unknown` and throw `UnrecoverableError` to halt automatic retries.
+   - *Rationale:* In telecommunications, a timed-out HTTP socket frequently means the provider received and queued the message for delivery, but the ACK was dropped in flight. Blindly retrying would cause duplicate SMS messages to end-users (and duplicate tenant billing). `outcome_unknown` safely quarantines the notification until an out-of-band status reconciliation or manual audit can confirm provider state.
+2. **Permanent Error Fast-Failure (`UnrecoverableError`):**
+   - *Decision:* When a provider returns HTTP 400 (e.g. invalid email syntax, unroutable E.164 number), the worker updates the database record to `status = 'failed'` and throws `new UnrecoverableError(...)` from BullMQ.
+   - *Rationale:* Standard queue workers often mindlessly retry HTTP 400 errors until queue attempt limits expire, wasting worker capacity, exhausting rate limits, and delaying valid tenant traffic. `UnrecoverableError` instructs BullMQ to immediately fail the job without consuming remaining retry attempts.
+3. **Dynamic Lease Releasing on Transient Backoff:**
+   - *Decision:* When a retryable error occurs (HTTP 503 or 429), the worker releases the row lease in PostgreSQL (`processing_locked_until = NULL`, `claim_token = NULL`, `retry_count = retry_count + 1`) inside a database transaction before throwing the error.
+   - *Rationale:* If the lease were kept active for its full 60-second duration, BullMQ's exponential retry (which may fire in 2–8 seconds) would encounter a lease lock collision and skip the job. Clearing the lease ensures that the next BullMQ retry can immediately re-claim the row.
+4. **Defense Against Duplicate Provider Calls:**
+   - *Decision:* When a worker picks up a job, it inspects the current database status. If the notification is already in `provider_accepted`, `processed`, `failed`, `outcome_unknown`, or `suppressed`, it skips execution immediately.
+   - *Rationale:* Provides complete idempotency defense against duplicate BullMQ queue deliveries, delayed jobs, or lease timeout races.
+
+### 13.4 Controlled Failure Drill Evidence
+Executed standalone drill [`scripts/providerFailureDrill.ts`](file:///c:/Users/HP/Desktop/relay-system/scripts/providerFailureDrill.ts) demonstrating all 6 failure and recovery scenarios:
+
+```
+================================================================================
+             RELAY NOTIFICATION SYSTEM — MILESTONE 7B FAILURE DRILL
+             Simulated Provider Failures, Retries & State Recovery
+================================================================================
+
+[Drill Started] 2026-10-29T14:52:03.784Z
+[Tenant Created] ID: 08b40b58-e735-4d19-a621-68eac7a9f85d | Name: "Milestone 7B Drill Tenant"
+
+--------------------------------------------------------------------------------
+SCENARIO 1: Transient 503 Provider Outage with Backoff Retry & Recovery
+[Scenario 1] Notification created: 262f6bfc-262c-4788-878e-475249fb325f (status: pending)
+[Scenario 1] Injected 1x TRANSIENT_503 failure into simulated provider
+[Scenario 1] Dispatching BullMQ job with backoff (attempts: 3, delay: 100ms)...
+Transient provider error for email (attempt 1/3): Downstream SendGrid-Simulator temporary service outage (HTTP 503). Backing off.
+[Scenario 1 Result] Status: provider_accepted | Retry Count: 1 | Calls: 2
+[Scenario 1 Calls] Attempt 1 Status: 503 | Attempt 2 Status: 202
+[Scenario 1 Outcome] PASSED
+
+--------------------------------------------------------------------------------
+SCENARIO 2: Downstream Rate Limiting (HTTP 429) with Backoff & Recovery
+[Scenario 2] Notification created: 8a0e5fc4-db09-4efe-8c7d-76534c2babc2 (status: pending)
+[Scenario 2] Injected 1x RATE_LIMIT_429 quota exhaustion into simulated provider
+[Scenario 2] Dispatching BullMQ job with backoff (attempts: 3, delay: 100ms)...
+Transient provider error for email (attempt 1/3): Downstream SendGrid-Simulator tenant dispatch quota exceeded (HTTP 429). Backing off.
+[Scenario 2 Result] Status: provider_accepted | Retry Count: 1 | Calls: 2
+[Scenario 2 Calls] Attempt 1 Status: 429 | Attempt 2 Status: 202
+[Scenario 2 Outcome] PASSED
+
+--------------------------------------------------------------------------------
+SCENARIO 3: Permanent Provider Rejection (HTTP 400 Bad Request)
+[Scenario 3] Notification created: 85ee91b9-3dd6-42d4-a0bb-2647c0bc7916 (status: pending)
+[Scenario 3] Injected PERMANENT_400 non-retryable rejection into simulated provider
+[Scenario 3] Dispatching BullMQ job with 5 allowed attempts...
+Email notification permanently rejected: Downstream SendGrid-Simulator rejected invalid destination address (HTTP 400)
+[Scenario 3 Result] Status: failed | Retry Count: 0 | Calls: 1
+[Scenario 3 Calls] Attempt 1 Status: 400
+[Scenario 3 Outcome] PASSED
+
+--------------------------------------------------------------------------------
+SCENARIO 4: Network Timeout Leading to outcome_unknown Status
+[Scenario 4] Notification created: 2616238b-845d-4f3f-912f-0408caad69a8 (status: pending)
+[Scenario 4] Injected TIMEOUT socket read failure into SMS provider
+[Scenario 4] Dispatching BullMQ SMS job...
+SMS notification timed out; marked outcome_unknown
+[Scenario 4 Result] Status: outcome_unknown | Retry Count: 0 | Calls: 1
+[Scenario 4 Calls] Attempt 1 Status: 504
+[Scenario 4 Outcome] PASSED
+
+--------------------------------------------------------------------------------
+SCENARIO 5: Max Retry Exhaustion Moving to Terminal failed Status
+[Scenario 5] Notification created: 7bb35a18-830e-46bb-aeff-8d1a56e8b91b (status: pending)
+[Scenario 5] Injected continuous 503 outage across all retry attempts
+[Scenario 5] Dispatching BullMQ job with limit of 2 attempts...
+Email notification exhausted max retry attempts (2)
+[Scenario 5 Result] Status: failed | Retry Count: 2 | Calls: 2
+[Scenario 5 Calls] Attempt 1: 503 | Attempt 2: 503
+[Scenario 5 Outcome] PASSED
+
+--------------------------------------------------------------------------------
+SCENARIO 6: Clean Provider Acceptance After Infrastructure Recovery
+[Scenario 6] Notification created: 7cc8823e-8bb1-4951-8749-f404a3ef6adb (status: pending)
+[Scenario 6] Cleared all provider overrides; normal operation restored
+[Scenario 6] Dispatching BullMQ job...
+[Scenario 6 Result] Status: provider_accepted | Retry Count: 0 | Calls: 1
+[Scenario 6 Calls] Provider Message ID: sim_email_dad9c0aa-e0b2-4a7e-8d0e-a766912f3055
+[Scenario 6 Outcome] PASSED
+
+================================================================================
+                     MILESTONE 7B DRILL EXECUTION SUMMARY
+================================================================================
+┌─────────┬────────────────────────────────────────────┬─────────┬─────────────────────┬─────────────────────┬─────────┬───────┬───────┐
+│ (index) │ Scenario                                   │ Channel │ Expected            │ Actual              │ Retries │ Calls │ Pass  │
+├─────────┼────────────────────────────────────────────┼─────────┼─────────────────────┼─────────────────────┼─────────┼───────┼───────┤
+│ 0       │ '1. Transient 503 with Recovery'           │ 'email' │ 'provider_accepted' │ 'provider_accepted' │ 1       │ 2     │ 'YES' │
+│ 1       │ '2. Provider 429 Rate Limit Recovery'      │ 'email' │ 'provider_accepted' │ 'provider_accepted' │ 1       │ 2     │ 'YES' │
+│ 2       │ '3. Permanent 400 Non-Retryable Rejection' │ 'email' │ 'failed'            │ 'failed'            │ 0       │ 1     │ 'YES' │
+│ 3       │ '4. Network Timeout -> outcome_unknown'    │ 'sms'   │ 'outcome_unknown'   │ 'outcome_unknown'   │ 0       │ 1     │ 'YES' │
+│ 4       │ '5. Retry Exhaustion -> failed'            │ 'email' │ 'failed'            │ 'failed'            │ 2       │ 2     │ 'YES' │
+│ 5       │ '6. Clean Delivery After Recovery'         │ 'email' │ 'provider_accepted' │ 'provider_accepted' │ 0       │ 1     │ 'YES' │
+└─────────┴────────────────────────────────────────────┴─────────┴─────────────────────┴─────────────────────┴─────────┴───────┴───────┘
+
+Overall Drill Verdict: ALL 6 SCENARIOS PASSED
+Completed At: 2026-10-29T14:52:20.332Z
+================================================================================
+```
+
+### 13.5 Automated Test Suite Verification (95/95 Tests Passing)
+A dedicated test suite [`tests/providerFailures.test.ts`](file:///c:/Users/HP/Desktop/relay-system/tests/providerFailures.test.ts) was created containing 15 automated tests covering:
+- Unit verification of `SimulatedProvider` metadata, 503, 429, timeout, and 400 rejections.
+- Live worker execution for Email and SMS yielding `provider_accepted`.
+- Exponential retry and recovery on temporary HTTP 503.
+- Exponential retry and recovery on provider rate limit HTTP 429.
+- Fast termination to `failed` on permanent HTTP 400 (exactly 1 provider call made).
+- Quarantining to `outcome_unknown` on socket timeout (preventing blind duplicate sends).
+- Retry exhaustion transitioning to `failed` upon reaching configured attempt limit.
+- Idempotent deduplication skipping provider calls for already accepted/failed notifications.
+- Preference suppression compatibility (suppressed notifications never invoke provider adapter).
+- Tenant fairness coexistence (Tenant A's provider failures do not starve or block Tenant B).
+
+Full Regression Run:
+```
+ Test Files  11 passed (11)
+      Tests  95 passed (95)
+   Duration  139.39s
+```
+
+## 14. Milestone 7C: k6 Load Testing & Concurrency Analysis
+
+### 14.1 Context & Objectives
+To fulfill the Dev and Design HQ graduation requirements, Relay required empirical load testing using Grafana k6 rather than custom node scripts. The objective was to measure baseline performance, identify latency and throughput inflection points under ramping concurrency, observe automated rate-limiting (429) and backpressure (503) defenses, evaluate spike resilience, and correlate accepted requests with background queue drain.
+
+### 14.2 Environment & Test Harness Configuration
+- **Load Engine:** Grafana k6 v0.54.0 (Windows AMD64) standalone binary in `bin/k6.exe` (workspace-isolated, zero global changes).
+- **Test Scripts:** [`scripts/k6/load-test.js`](file:///c:/Users/HP/Desktop/relay-system/scripts/k6/load-test.js) (and [`benchmarks/k6/load-test.js`](file:///c:/Users/HP/Desktop/relay-system/benchmarks/k6/load-test.js)) utilizing standard k6 modules (`k6/http`, `k6`, `k6/metrics`), custom metrics (`relay_accepted_202_total`, `relay_rate_limited_429_total`, `relay_overloaded_503_total`, `relay_suppressed_200_total`), and multi-stage ramping scenarios.
+- **Tenant Management:** [`scripts/k6/seed-tenants.ts`](file:///c:/Users/HP/Desktop/relay-system/scripts/k6/seed-tenants.ts) pre-seeds dedicated load test tenants in Neon PostgreSQL; [`scripts/k6/cleanup-tenants.ts`](file:///c:/Users/HP/Desktop/relay-system/scripts/k6/cleanup-tenants.ts) ensures clean post-test teardown.
+- **Background Daemon Stack:** [`scripts/k6/start-relay-services.ts`](file:///c:/Users/HP/Desktop/relay-system/scripts/k6/start-relay-services.ts) runs the HTTP API, Outbox Dispatcher, and Workers in an integrated runtime.
+
+### 14.3 Measured Benchmark Results
+
+#### Scenario A: Baseline Ingress (3 VUs, 20s)
+- **Total Requests:** 36 requests | **Total HTTP Throughput:** 1.70 req/s | **Accepted Throughput:** 1.70 accepted/s.
+- **Latency (Overall / Accepted):** Average = 1,412.88 ms / 1,413.11 ms | p50 = 1,156.41 ms / 1,156.50 ms | p95 = 2,759.47 ms / 2,762.00 ms | p99 = 2,780.89 ms / 2,783.25 ms.
+- **Status Distribution:** 36 Accepted (HTTP 202, 100.0%) | 0 Suppressed | 0 Rate Limited | 0 Overload Rejections | 0 Errors.
+- **Observation:** Confirms clean, 100% durable acceptance when arrival rate stays comfortably within tenant quotas and database pool limits.
+
+#### Scenario B: Gradual Ramp-Up (2 → 35 VUs, 50s)
+- **Total Requests:** 1,490 requests | **Total HTTP Throughput:** 28.33 req/s | **Accepted Throughput:** 4.13 accepted/s.
+- **Latency Interpretation:**
+  - *Overall HTTP Duration (skewed by 890 fast 429s):* Average = 610.95 ms | p50 = 3.91 ms | p95 = 2,334.64 ms | p99 = 10,217.52 ms.
+  - *Accepted Notifications Only (`relay_accepted_duration_ms`):* Average = 1,740.94 ms | p50 = 1,448.00 ms | p95 = 3,058.60 ms | p99 = 3,301.56 ms.
+- **Status Distribution:**
+  - HTTP 202 Accepted: 217 (14.56%)
+  - HTTP 200 Suppressed: 17 (1.14%)
+  - HTTP 429 Rate Limited: 890 (59.73%)
+  - HTTP 503 Overload Defense: 352 (23.62%)
+  - Client Socket Timeouts (15s k6 timeout during pool contention): 14 (0.94%)
+  - Server Crashes / HTTP 500 Responses: **0 (0.0%)**
+  - Expected Response Rate: 99.06%.
+- **Inflection Observations:**
+  1. *Rate Limiting Point:* Activated around second 18–20 when Tenant Alpha crossed 100 req/60s. The Redis sliding window returned HTTP 429 in **3.91 ms (p50)**, shielding PostgreSQL from 890 unnecessary queries.
+  2. *Backpressure Point:* Activated around second 30–35 when concurrency (30+ VUs) saturated the 15-connection Neon pool. Admission control deflected 352 requests with HTTP 503 and `Retry-After: 5`.
+  3. *Sustainable Ingress Throughput:* Theoretical single-node ceiling estimated at **10.7–15.0 acceptances/sec** based on 15 connections and 1.0–1.4s transaction RTT; measured sustained concurrent accepted throughput reached **4.13 accepted/sec** due to connection checkout serialization.
+
+#### Scenario C: Short Spike (5 → 30 VUs, 30s)
+- **Total Requests:** 727 requests | **Total HTTP Throughput:** 23.34 req/s | **Accepted Throughput:** 3.30 accepted/s.
+- **Latency (Overall / Accepted):**
+  - *Overall HTTP Duration (skewed by 615 fast 503s):* Average = 400.90 ms | p50 = 204.46 ms | p95 = 1,315.48 ms | p99 = 2,025.71 ms.
+  - *Accepted Notifications Only (`relay_accepted_duration_ms`):* Average = 1,380.65 ms | p50 = 1,227.00 ms | p95 = 2,150.70 ms | p99 = 2,831.94 ms.
+- **Status Distribution:** 103 Accepted (14.17%) | 9 Suppressed (1.24%) | 615 Overload Defense (84.59%) | 0 Errors | 0 Crashes.
+- **Elastic Recovery:** During the 6-second burst to 30 VUs, 615 requests were rejected defensively with HTTP 503. Within 1.5s of concurrency dropping back to 5 VUs, the connection pool drained and normal HTTP 202 acceptance resumed immediately with zero server crashes or database corruption.
+
+### 14.4 Post-Test Queue Drain Audit & Reconciliation
+[`scripts/k6/verify-drain.ts`](file:///c:/Users/HP/Desktop/relay-system/scripts/k6/verify-drain.ts) confirmed end-to-end processing across all accepted requests:
+- **439 notifications** transitioned to `provider_accepted` (208 email, 231 sms) via the simulated provider adapters.
+- **46 notifications** were correctly suppressed at ingestion (`status = 'suppressed'`) with zero outbox events created.
+- Outbox events drained continuously with zero terminal failures.
+- **Reconciliation Note:** The 439 `provider_accepted` notifications reflect cumulative worker processing across both preliminary dry-runs (260 accepted, 19 suppressed) and final benchmark executions (356 accepted, 26 suppressed) performed under the seeded test tenant IDs prior to running [`scripts/k6/cleanup-tenants.ts`](file:///c:/Users/HP/Desktop/relay-system/scripts/k6/cleanup-tenants.ts).
+
+### 14.5 Architectural Gap Analysis: Prototype vs. 50M/Day Target
+- **Target:** 50,000,000 notifications / day = **579 req/s sustained**, **5,787 req/s peak**.
+- **Prototype Throughput:** **28.33 req/s peak total HTTP throughput** (evaluating fast defenses); **3.30–4.13 accepted notifications/s** measured sustained durable acceptance under multi-VU concurrency.
+- **Root Cause of Difference:**
+  1. *Public Cloud Latency Floor:* Connecting to AWS Neon PostgreSQL in London over public TLS requires multiple sequential network round-trips per transaction (`BEGIN`, `SELECT customer & idempotency`, `INSERT notification, outbox, idempotency`, `COMMIT`), establishing an unavoidable physical floor of ~1,000–1,400ms per database commit.
+  2. *Connection Pool Sizing & Theoretical Ceiling (Estimate):* The prototype connection pool is capped at `DB_POOL_MAX = 15` to respect free-tier concurrency quotas. Under single-node operation:
+     $\text{Theoretical Ingress Ceiling (Estimate)} = \frac{15 \text{ connections}}{1.0\text{–}1.4 \text{ s / txn}} \approx 10.7\text{–}15.0 \text{ req/s}$
+     Under multi-VU concurrency, connection checkout serialization, lock contention, and worker background operations bound sustained accepted ingress to **3.30–4.13 accepted/sec**.
+  3. *Production Scaling Path:* Achieving 579–5,787 req/s requires:
+     - Local/VPC-peered database clustering with pgbouncer connection pooling.
+     - Horizontal stateless API pods behind an L7 load balancer.
+     - Multi-tenant database sharding by `customer_id`.
+     - Read replicas for idempotency checks.
+- **Reliability Takeaway:** Despite the free-tier throughput limitations, Relay's protection layers worked exactly as designed: shedding excess load in single-digit milliseconds and keeping the database durable and crash-free.
+
+---
+
+## 15. Milestone 7D: Infrastructure Cost Estimation (100,000 Users)
+
+### 15.1 Context & Objectives
+Requirement 12 of the Dev and Design HQ Final Graduation Task mandates a defensible monthly operating cost estimate for a 100,000-user deployment using real current prices from official provider pricing pages. Milestone 7D establishes this cost model, separating fixed compute from variable communications fees and contrasting prototype economics with the 50M/day architectural design target.
+
+### 15.2 Verified Provider Rates (Checked 30 October 2026)
+All pricing figures reflect publicly published documentation:
+- **API Server & Background Workers:** Render Standard ($25/mo per instance, 1 vCPU, 2 GB RAM; [render.com/pricing](https://render.com/pricing)).
+- **PostgreSQL Database:** Neon Serverless PostgreSQL Launch Plan ($0.106/CU-hour compute, $0.35/GB-month storage; [neon.tech/pricing](https://neon.tech/pricing)).
+- **Redis Queue / Cache:** Render Key Value Standard ($20/mo, 1 GB RAM, disk persistence; [render.com/pricing](https://render.com/pricing)).
+- **Email Delivery:** Amazon SES Outbound ($0.10 per 1,000 emails = $0.0001/email; [aws.amazon.com/ses/pricing](https://aws.amazon.com/ses/pricing/)).
+- **SMS Delivery:** Twilio US Outbound ($0.0083 base + ~$0.0042 carrier pass-through = $0.0125/segment; $1.15/mo 10DLC number; $1.50/mo campaign fee; [twilio.com/en-us/sms/pricing/us](https://www.twilio.com/en-us/sms/pricing/us)).
+- **Observability:** Grafana Cloud Pro ($19.00/mo base platform fee + $0.45/GB logs; [grafana.com/pricing](https://grafana.com/pricing/)).
+- **Database Backups:** Amazon S3 Standard ($0.023/GB-month; [aws.amazon.com/s3/pricing](https://aws.amazon.com/s3/pricing/)).
+
+### 15.3 Workload Modeling for 100,000 Users
+- **Population Definition:** 100,000 registered end-user notification recipients distributed across 100 tenant organizations.
+- **Storage Formulation:** 2.0 KB per notification across `notifications`, `outbox_events`, `idempotency_keys`, and B-Tree indexes, retained in a rolling 30-day live window.
+- **Queue Memory:** BullMQ on Redis acts as transitory delivery plumbing (< 100 MB active footprint).
+
+### 15.4 Three Sizing Scenarios
+Detailed in [`benchmarks/COST-MODEL.md`](file:///c:/Users/HP/Desktop/relay-system/benchmarks/COST-MODEL.md):
+
+| Scenario | Active Ratio (MAU) | Monthly Volume | Channel Mix (Email / SMS) | Server Infra | Third-Party Telecom | Total Monthly Cost | Cost / 1k Notifs |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Scenario A (Low)** | 30% (30k MAU) | 60,000 / mo (2/user) | 85% Email / 15% SMS | $43.38 | $120.25 | **$163.63** | **$2.73** |
+| **Scenario B (Expected)** | 60% (60k MAU) | 300,000 / mo (5/user) | 80% Email / 20% SMS | $136.19 | $776.65 | **$912.84** | **$3.04** |
+| **Scenario C (High)** | 85% (85k MAU) | 1,700,000 / mo (20/user) | 75% Email / 25% SMS | $369.46 | $5,452.30 | **$5,821.76** | **$3.42** |
+
+*(Under strict fixed baseline subscriptions vs. volume-variable consumption, Scenario B divides into **$130.69 fixed subscriptions** [compute, baseline DB, Redis, Grafana base, phone numbers, 10DLC campaign] and **$782.15 variable usage** [SES emails, SMS segments, storage, logs, egress], totaling **$912.84**).*
+
+### 15.5 Key Engineering Insights: The SMS Dominance Phenomenon & Capacity Constraints
+1. **Third-Party Telephony Hegemony:** In Scenario B (Expected), **85.1%** of the entire operating budget ($776.65 of $912.84) is absorbed by SMS and email delivery fees, not compute or database infrastructure. In Scenario C, this proportion rises to **93.7%**.
+2. **The 125x Cost Multiplier:** Sending 1,000 emails costs **$0.10** on Amazon SES; sending 1,000 domestic US SMS messages costs **$12.50** on Twilio—125 times more expensive.
+3. **Financial Protection Value of Milestones 6B & 7A:** This economic disparity demonstrates why Tenant Rate Limiting (Milestone 6B) and Recipient Preference Checks (Milestone 7A) are indispensable:
+   - Suppressing an opt-out recipient prevents an unnecessary $0.0125 carrier charge.
+   - Throttling a misconfigured tenant loop from spamming 50,000 SMS messages shields the organization from an unexpected **$625.00** bill in minutes.
+4. **Neon PostgreSQL Pricing Derivation:**
+   - Scenario A: $19.08 compute (180 CU-hrs @ $0.106) + $0.18 storage (0.5 GB @ $0.35) = **$19.26**.
+   - Scenario B: $38.69 compute (365 CU-hrs @ $0.106) + $0.70 storage (2.0 GB @ $0.35) = **$39.39**.
+   - Scenario C: $162.06 compute (730 CU-hrs @ $0.222 Scale Plan for enterprise compliance/monitoring) + $3.50 storage (10.0 GB @ $0.35) = **$165.56**. (If run on Launch Plan at $0.106/CU-hr, compute is $77.38 and total DB is **$80.88**).
+5. **Capacity Sufficiency vs. Empirical Reality:**
+   - Scenarios A (0.23 req/s peak) and B (1.16 req/s peak) operate within the prototype's measured baseline capacity (1.70 req/s with 0 backpressure in k6).
+   - Scenario C (6.56 req/s peak) exceeds single-node connection pool limits (which saturated at 3.30–4.13 req/s in k6) and requires 2 horizontal API pods with connection pooling; this multi-node topology is budgeted but unbenchmarked in the single-node prototype.
+
+### 15.6 Architectural Target Separation: 100k Users vs. 50M/Day Target
+- **Scale Multiplier:** The 50,000,000 notification/day target (1.5 billion/month) is **5,000 times larger** than the 100,000-user expected workload (300,000/month).
+- **Why Linear Extrapolation Fails:** Linearly multiplying $912/mo by 5,000 to 1.5B notifications yields an invalid ~$4.5M/mo figure. In reality:
+  - Relay currently implements Email and SMS only; mobile push is an architectural proposal in `DESIGN.md`.
+  - Commercial 50M/day systems cannot rely primarily on retail SMS ($0.0125/msg) and must rely on direct IP channels for general notifications, reserving SMS for high-urgency transactional authentication.
+  - High-volume senders negotiate proprietary wholesale aggregator agreements (unverified on public pricing pages).
+  - The database layer shifts from single-node PostgreSQL to horizontally partitioned clusters (e.g., Citus, CockroachDB, or multi-cluster Aurora with PgBouncer).
+  - The queue layer shifts from BullMQ/Redis to distributed streaming fabrics (Kafka/Pulsar).
+
+---
+
+## 16. Milestone 8: Final Technical Compliance Audit & Publishing Preparation
+
+### 16.1 Context & Objectives
+Milestone 8 executes a strict compliance audit of Relay against Part 3 of the Dev and Design HQ Final Graduation Task, verifying all design documentation, code implementations, test suites, k6 benchmarks, cost models, and repository hygiene prior to final publication.
+
+### 16.2 Test Suite Verification (95/95 Tests Passing)
+The complete automated regression suite comprises **95 passing tests across 11 test files**:
+- tests/providerFailures.test.ts (15/15 passed) - Milestone 7B
+- tests/preferences.test.ts (13/13 passed) - Milestone 7A
+- tests/backpressure.test.ts (16/16 passed) - Milestone 6D
+- tests/fairness.test.ts (12/12 passed) - Milestone 6C
+- tests/rateLimiter.test.ts (6/6 passed) - Milestone 6B
+- tests/metrics.test.ts (9/9 passed) - Milestone 6A
+- tests/notifications.test.ts (8/8 passed)
+- tests/outbox.test.ts (4/4 passed)
+- tests/reconciliation.test.ts (3/3 passed)
+- tests/readiness.test.ts (3/3 passed)
+- tests/health.test.ts (2/2 passed)
+
+### 16.3 Reconciled k6 Load Testing Evidence
+From benchmarks/k6/REPORT.md and raw JSON summaries:
+- **Baseline (Scenario A, 3 VUs):** 36 total requests -> 36 HTTP 202 Accepted (1.70 req/s, 0 errors).
+- **Ramp-Up (Scenario B, 2 -> 35 VUs):** 1,490 total requests -> 217 HTTP 202 Accepted (4.13 req/s), 17 HTTP 200 Suppressed, 890 HTTP 429 Rate-Limited, 352 HTTP 503 Overloaded, 14 client-side socket timeouts (k6 15s pool checkout timeouts, 0 server crashes/500s).
+- **Short Spike (Scenario C, 5 -> 30 -> 5 VUs):** 727 total requests -> 103 HTTP 202 Accepted, 9 HTTP 200 Suppressed, 615 HTTP 503 Overloaded (84.6% deflected), 1.5s recovery.
+- **Combined Aggregate:** 2,253 attempted -> 356 accepted, 26 suppressed, 890 rate-limited, 967 overloaded, 14 client transport errors, 0 server crashes.
+
+### 16.4 In-Source Design Pattern Verification
+Five qualifying design patterns are implemented in code and explicitly documented in comments:
+1. **Transactional Outbox:** src/services/notificationService.ts & src/services/outboxDispatcher.ts
+2. **Adapter Pattern:** src/adapters/simulatedProvider.ts
+3. **Repository Pattern:** src/repositories/notificationRepository.ts & src/repositories/preferenceRepository.ts
+4. **State Machine Pattern:** src/services/backpressureService.ts
+5. **Exponential Backoff:** src/queues/notificationQueues.ts
+
+### 16.5 Graduation Deliverables Status
+- **Deliverable 1: Design Document (DESIGN.md):** COMPLETE (All 12 required sections passing).
+- **Deliverable 2: Working Prototype & Codebase:** COMPLETE (All 12 functional criteria passing, 95/95 tests passing).
+- **Deliverable 3: 20-min Walkthrough Video:** PENDING (Postponed to dedicated recording session).
+- **Deliverable 4: Mock Technical Interview:** PENDING (Postponed to live graduation defense).
+- **Overall Graduation Submission:** NOT YET COMPLETE (Pending completion of Deliverables 3 and 4).

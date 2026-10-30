@@ -84,11 +84,11 @@ export class ReconciliationService {
             if (job) {
               const state = await job.getState();
               if (state === "completed") {
-                console.log(`Job for notification ${notification.id} already completed, marking as processed`);
+                console.log(`Job for notification ${notification.id} already completed, marking as provider_accepted`);
                 await client.query("BEGIN");
                 await client.query(
                   `UPDATE notifications 
-                   SET status = 'processed', processing_locked_until = NULL, claim_token = NULL, updated_at = NOW()
+                   SET status = 'provider_accepted', processing_locked_until = NULL, claim_token = NULL, updated_at = NOW()
                    WHERE id = $1 AND status = 'processing'`,
                   [notification.id]
                 );
@@ -105,11 +105,11 @@ export class ReconciliationService {
             if (job) {
               const state = await job.getState();
               if (state === "completed") {
-                console.log(`Job for notification ${notification.id} already completed, marking as processed`);
+                console.log(`Job for notification ${notification.id} already completed, marking as provider_accepted`);
                 await client.query("BEGIN");
                 await client.query(
                   `UPDATE notifications 
-                   SET status = 'processed', processing_locked_until = NULL, claim_token = NULL, updated_at = NOW()
+                   SET status = 'provider_accepted', processing_locked_until = NULL, claim_token = NULL, updated_at = NOW()
                    WHERE id = $1 AND status = 'processing'`,
                   [notification.id]
                 );

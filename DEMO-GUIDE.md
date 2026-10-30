@@ -29,10 +29,10 @@ Execute these verification checks **15 minutes before the presentation**:
 | :--- | :--- | :--- | :--- |
 | **Node.js Runtime** | Node.js v20.x or higher | `node -v` | `v20.x.x` or higher |
 | **TypeScript Build** | Clean build (0 errors) | `npm.cmd run build` | Exits with code 0 |
-| **PostgreSQL Connection** | Neon Cloud Database reachable (migrations `001_initial.sql` through `005_notification_lifecycle.sql` applied) | `npx.cmd tsx src/database/check-connection.ts` | `Database connection successful!` |
+| **PostgreSQL Connection** | Neon Cloud Database reachable (migrations `001_initial.sql` through `006_notification_preferences.sql` applied) | `npx.cmd tsx src/database/check-connection.ts` | `Database connection successful!` |
 | **Redis Server** | Redis running locally | `redis-cli -p 6386 ping` (or port in `.env`) | `PONG` |
 | **Port Availability** | Ports 3000 (API) available | `netstat -ano \| findstr :3000` | No conflicting listener |
-| **Regression Suite** | All automated tests passing | `npm.cmd test` | `67 passed (67)` |
+| **Regression Suite** | All automated tests passing | `npm.cmd test` | `95 passed (95)` across 11 test files |
 
 > [!TIP]
 > **Port Note:** Relay's `.env` is pre-configured to connect to local Redis on port `6386` (or `6379`). Ensure your local Redis instance matches the `REDIS_URL` in `.env`.

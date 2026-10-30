@@ -2,6 +2,11 @@ import { Queue } from "bullmq";
 import { getRedisClientSync } from "../config/redis.js";
 import { env } from "../config/env.js";
 
+/**
+ * Pattern: Exponential Backoff Pattern
+ * Purpose: Defends downstream networks and internal workers from retry stampedes during transient failures.
+ * Failed BullMQ delivery jobs back off exponentially (delay * 2^attempt) before retrying, preventing provider overload.
+ */
 let emailQueueInstance: Queue | null = null;
 let smsQueueInstance: Queue | null = null;
 
