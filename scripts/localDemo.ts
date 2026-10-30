@@ -29,6 +29,8 @@ const child = spawn(process.execPath, commands[action], {
   env: {
     ...process.env,
     NODE_ENV: action === "test" ? "test" : "development",
+    DEMO_MODE: "true",
+    API_HOST: "127.0.0.1", METRICS_HOST: "127.0.0.1",
     DATABASE_URL: `postgresql://relay_demo:${encodeURIComponent(password)}@127.0.0.1:5544/relay_demo`,
     REDIS_URL: "redis://127.0.0.1:6390",
     PORT: "3200", RELAY_API_URL: "http://127.0.0.1:3200",

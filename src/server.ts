@@ -1,9 +1,6 @@
-import { app } from "./app.js";
-import { env } from "./config/env.js";
+import { startApiServer } from "./apiServer.js";
 
-const server = app.listen(env.PORT, "127.0.0.1", () => {
-    console.log(`Relay API running on port ${env.PORT} (RateLimit: ${env.RATE_LIMIT_MAX_REQUESTS} req / ${env.RATE_LIMIT_WINDOW_SECONDS}s)`);
-});
+const server = startApiServer();
 
 function shutdown(signal: string) {
     console.log(`Received ${signal}. Shutting down Relay API...`);

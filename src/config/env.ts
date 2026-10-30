@@ -7,6 +7,9 @@ const envSchema = z.object({
         .default("development"),
 
     PORT: z.coerce.number().int().min(1).max(65535).default(3000),
+    API_HOST: z.string().trim().min(1).optional(),
+    METRICS_HOST: z.string().trim().min(1).optional(),
+    DEMO_MODE: z.enum(["true", "false"]).default("false").transform(v => v === "true"),
     DASHBOARD_ENABLED: z.enum(["true", "false"]).default("false").transform(v => v === "true"),
 
     DATABASE_URL: z.string().url(),
@@ -44,4 +47,8 @@ const envSchema = z.object({
     DISPATCHER_MAX_QUEUE_BACKLOG: z.coerce.number().int().min(1).default(500),
 });
 
-export const env = envSchema.parse(process.env);
+export function parseEnv(input: NodeJS.ProcessEnv) {
+    return envSchema.parse(input);
+}
+
+export const env = parseEnv(process.env);

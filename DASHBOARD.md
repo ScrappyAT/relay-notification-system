@@ -39,7 +39,7 @@ npm run demo:dashboard
 
 Open **http://127.0.0.1:3100**, select **Relay demo workspace**, and send a test email or SMS. The tenant helper creates only a customer; notification statistics start empty and are computed from real submitted records. The simulator is local and does not contact SendGrid or Twilio.
 
-The `demo:*` scripts read ignored `.env.demo` and supply the same local database, Redis and API configuration to every process. The tenant helper rejects remote PostgreSQL hosts. The API and daemon metrics servers bind to `127.0.0.1`, and the dashboard scripts explicitly bind Next.js to `127.0.0.1`.
+The `demo:*` scripts read ignored `.env.demo` and supply the same local database, Redis and API configuration to every process. They explicitly set `DEMO_MODE=true` and loopback API/metrics hosts, including for demo tests where dashboard reads are disabled. The tenant helper rejects remote PostgreSQL hosts. Demo API and daemon metrics servers bind to `127.0.0.1`, and the dashboard scripts explicitly bind Next.js to `127.0.0.1`.
 
 Stop processes with Ctrl+C in their terminals. Stop the isolated infrastructure while preserving data with:
 
@@ -54,6 +54,18 @@ The named PostgreSQL volume persists. Initialization runs only on the first use 
 Your existing database must already have migrations 001–006 applied. Keep `DATABASE_URL` and `REDIS_URL` in the root `.env`; never copy these into frontend settings. Add `DASHBOARD_ENABLED=true` to the root `.env`. Restart the API using `npm run dev`, then run `npm run dispatcher`, `npm run workers`, and `npm run reconcile` in separate terminals.
 
 The existing API defaults to port 3000. `npm run dashboard` starts the frontend on port 3100 and proxies to `http://127.0.0.1:3000`. For another API port, copy `apps/dashboard/.env.example` to `apps/dashboard/.env.local` and change **only** `RELAY_API_URL` to an HTTP localhost address. This is a server-only variable; there are no `NEXT_PUBLIC_*` credentials. When using the isolated `demo:dashboard` script, its explicit environment takes precedence over this file.
+
+### Backend listener configuration outside the demo
+
+`API_HOST` and `METRICS_HOST` independently configure the Express API and all daemon metrics listeners. When both `DEMO_MODE=false` and `DASHBOARD_ENABLED=false` (the defaults), omitting a host preserves the original Node unspecified-interface behavior (`::` where available, otherwise `0.0.0.0`). `NODE_ENV` does not implicitly enable demo mode.
+
+| Mode | API binding | Daemon metrics binding |
+| --- | --- | --- |
+| Non-demo, no host settings | Original Node default | Original Node default |
+| Non-demo, host settings supplied | `API_HOST` | `METRICS_HOST` |
+| `DEMO_MODE=true` or `DASHBOARD_ENABLED=true` | Forced `127.0.0.1` | Forced `127.0.0.1` |
+
+For example, a non-demo container can use `API_HOST=0.0.0.0` while keeping `METRICS_HOST=127.0.0.1`, or supply a separate metrics interface for its scraper. Configure firewall/access controls for non-demo metrics as in the original backend. Dashboard reads remain disabled by default; enabling the dashboard forces both backend listener types to loopback regardless of host overrides. The existing dashboard Host/origin/socket guards and frontend localhost binding remain in place.
 
 ## Views and data definitions
 

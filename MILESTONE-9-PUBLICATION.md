@@ -40,9 +40,19 @@ Compared against `b321da2`, the following remain byte-for-byte unchanged:
 - Redis/BullMQ integration, fairness, backpressure and reconciliation services.
 - All 11 original test files and original test configuration.
 
-The backend integration changes are limited to registering the dashboard router, adding the explicit `DASHBOARD_ENABLED` setting and localhost request checks, disabling cross-origin CORS grants, and binding API/daemon metrics listeners to loopback. The new router adds only GET endpoints: `/v1/dashboard/customers`, `/overview`, `/notifications`, `/preferences`, and `/monitoring`. Its PostgreSQL queries are SELECT-only and parameterized. Queue monitoring reads BullMQ counts; no queue-control or failure-control administrative endpoint was added.
+The backend integration changes register the dashboard router, add explicit dashboard/demo settings and localhost request checks, and disable cross-origin CORS grants. Following PR #1 review, API/daemon metrics listeners are forced to loopback only when dashboard or demo mode is enabled; non-demo bindings are independently configurable with `API_HOST`/`METRICS_HOST` and otherwise retain the original Node defaults. The new router adds only GET endpoints: `/v1/dashboard/customers`, `/overview`, `/notifications`, `/preferences`, and `/monitoring`. Its PostgreSQL queries are SELECT-only and parameterized. Queue monitoring reads BullMQ counts; no queue-control or failure-control administrative endpoint was added.
 
 ## Features and manual evidence
+
+### PR #1 listener-binding review follow-up
+
+The original dashboard commit hardcoded `127.0.0.1` into API and process-metrics startup for every environment. Baseline `b321da2` omitted the host and therefore supported Node's normal unspecified-interface binding. The unconditional change could prevent non-demo container ingress or external metrics scraping.
+
+The fix adds independent optional `API_HOST` and `METRICS_HOST` configuration. Outside dashboard/demo mode, an unset host is omitted from `listen()` options to preserve the exact original IPv6/IPv4 default behavior. Either `DEMO_MODE=true` or `DASHBOARD_ENABLED=true` forces **both** listeners to `127.0.0.1`, overriding wildcard host settings. The isolated demo launcher explicitly sets demo mode and loopback hosts even for test runs with dashboard reads disabled. Next.js and Docker demo bindings, disabled-by-default dashboard reads, and all existing local-access middleware are unchanged.
+
+API startup is exposed through a small `startApiServer` factory so tests can inspect real bound sockets without importing the CLI's signal handlers. Notification processing and shutdown behavior are unchanged.
+
+Follow-up verification: **140/140 tests passed, 0 failed/skipped across 15 files**, including **95/95 original backend tests** and **15 new binding tests**. The new tests cover parsed defaults in development/test/production, independent hosts, empty-host rejection, strict boolean flags, real API/metrics socket addresses, loopback enforcement despite IPv4/IPv6 wildcard overrides, and disabled/protected dashboard endpoints. Backend build, dashboard production build, dashboard TypeScript check and whitespace checks passed. Tests used only the separate local verification services; no remote database or existing demonstration data was modified.
 
 Overview, Send Notification, Notifications, Preferences, Monitoring and Failure Simulator use live backend data. Loading, errors and empty states are implemented. Provider acceptance and confirmed delivery remain distinct.
 
@@ -60,7 +70,7 @@ Existing screenshots are included as [desktop overview](docs/screenshots/overvie
 - Existing local configuration was preserved in the ignored file to match the existing volume. The setup helper refuses to invent replacement credentials when it detects an existing volume without configuration.
 - Changed-file scans found no private-key blocks, GitHub access tokens or AWS access-key patterns. Manual review distinguished explicit synthetic negative-test strings from actual secrets. This is a scoped source audit, not a claim of a comprehensive security assessment.
 - The frontend uses a server-only localhost proxy with an operation allowlist, origin checks, no-store responses, redirect rejection and timeouts. Database credentials are absent from frontend code and browser environment variables.
-- Docker ports and API/dashboard/metrics listeners remain loopback-only. No hosting, tunnel, public deployment or CI deployment configuration was introduced.
+- Demo Docker ports, the dashboard frontend, and API/metrics listeners with dashboard or demo mode enabled remain loopback-only. Non-demo backend listeners retain their original defaults with optional independent host configuration. No hosting, tunnel, public deployment or CI deployment configuration was introduced.
 - **History limitation:** the preserved original dashboard commit contains disposable localhost demo defaults. These were never production secrets. History is not rewritten; the current tree externalizes the password and new installations generate a random value.
 - **Authentication limitation:** no tenant authentication or authorization exists. Keep the dashboard and all administrative endpoints local; localhost checks do not make it production-ready.
 - Provider acceptance does not confirm recipient delivery; worker liveness remains uninstrumented. Queue/outbox monitoring is global and API counters are process-local.
@@ -115,10 +125,13 @@ The inventory below records the complete publication scope; the new publication 
 | A | `scripts/localDemo.ts` |
 | A | `scripts/setupLocalDemo.ts` |
 | A | `src/middleware/localOnly.ts` |
+| A | `src/apiServer.ts` |
+| A | `src/config/listen.ts` |
 | A | `src/routes/dashboard.ts` |
 | A | `tests/dashboard.integration.test.ts` |
 | A | `tests/dashboard.test.ts` |
 | A | `tests/dashboardProxy.test.ts` |
+| A | `tests/serverBindings.test.ts` |
 | M | `.env.example` |
 | M | `.gitignore` |
 | M | `package.json` |
