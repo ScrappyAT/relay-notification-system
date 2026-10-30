@@ -1,15 +1,15 @@
-# Isolated localhost-only demonstration services. Credentials are disposable local defaults.
+# Localhost-only services. Supply the ignored .env.demo with --env-file.
 name: relay-dashboard
 services:
   postgres:
     image: postgres:16-alpine
     environment:
       POSTGRES_USER: relay_demo
-      POSTGRES_PASSWORD: relay_demo_local
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Run npm run demo:setup and use --env-file .env.demo}
       POSTGRES_DB: relay_demo
       TZ: UTC
     ports:
-      - "127.0.0.1:5544:5432"
+      - "127.0.0.1:${RELAY_DEMO_POSTGRES_PORT:-5544}:5432"
     volumes:
       - dashboard-postgres:/var/lib/postgresql/data
       - ./src/database/migrations:/docker-entrypoint-initdb.d:ro
@@ -21,7 +21,7 @@ services:
   redis:
     image: redis:7-alpine
     ports:
-      - "127.0.0.1:6390:6379"
+      - "127.0.0.1:${RELAY_DEMO_REDIS_PORT:-6390}:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 2s

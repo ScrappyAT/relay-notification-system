@@ -21,6 +21,7 @@
     "dashboard:build": "npm --prefix apps/dashboard run build",
     "dashboard:tenant": "tsx scripts/dashboardTenant.ts",
     "demo:api": "tsx scripts/localDemo.ts api",
+    "demo:setup": "tsx scripts/setupLocalDemo.ts",
     "demo:dispatcher": "tsx scripts/localDemo.ts dispatcher",
     "demo:workers": "tsx scripts/localDemo.ts workers",
     "demo:reconcile": "tsx scripts/localDemo.ts reconcile",

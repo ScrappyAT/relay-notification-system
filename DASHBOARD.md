@@ -9,11 +9,14 @@ Prerequisites: Node.js 22.13+ (verified with Node 24), npm, Docker Desktop with 
 ```sh
 npm ci
 npm ci --prefix apps/dashboard
-docker compose -f compose.dashboard.yml up -d --wait
+npm run demo:setup
+docker compose --env-file .env.demo -f compose.dashboard.yml up -d --wait
 npm run demo:tenant
 ```
 
-The compose project creates PostgreSQL 16 on **127.0.0.1:5544** and Redis 7 on **127.0.0.1:6390**. PostgreSQL initializes a fresh volume with the six existing migrations in order. Historical migrations are unchanged. Its disposable local credentials are `relay_demo` / `relay_demo_local`, database `relay_demo`; never use them for an external service.
+The compose project creates PostgreSQL 16 on **127.0.0.1:5544** and Redis 7 on **127.0.0.1:6390**. PostgreSQL initializes a fresh volume with the six existing migrations in order. Historical migrations are unchanged. The database/user are `relay_demo`; `demo:setup` generates a random password in ignored `.env.demo`. No password belongs in tracked source or frontend settings. `.env.demo.example` contains a placeholder only.
+
+Existing installations: preserve `.env.demo` and the database volume. If a volume already exists without that file, setup stops; supply its existing password in ignored `.env.demo`. The helper never resets the database, rotates existing credentials, or deletes demonstration data. The prior implementation's disposable localhost password has been preserved in the ignored local file for this checkout.
 
 Open a separate terminal for each process:
 
@@ -36,12 +39,12 @@ npm run demo:dashboard
 
 Open **http://127.0.0.1:3100**, select **Relay demo workspace**, and send a test email or SMS. The tenant helper creates only a customer; notification statistics start empty and are computed from real submitted records. The simulator is local and does not contact SendGrid or Twilio.
 
-The `demo:*` scripts supply the same local database, Redis and API configuration to every process; no environment-file editing is required. The helper rejects remote PostgreSQL hosts. The API and daemon metrics servers bind to `127.0.0.1`, and the dashboard scripts explicitly bind Next.js to `127.0.0.1`.
+The `demo:*` scripts read ignored `.env.demo` and supply the same local database, Redis and API configuration to every process. The tenant helper rejects remote PostgreSQL hosts. The API and daemon metrics servers bind to `127.0.0.1`, and the dashboard scripts explicitly bind Next.js to `127.0.0.1`.
 
 Stop processes with Ctrl+C in their terminals. Stop the isolated infrastructure while preserving data with:
 
 ```sh
-docker compose -f compose.dashboard.yml down
+docker compose --env-file .env.demo -f compose.dashboard.yml down
 ```
 
 The named PostgreSQL volume persists. Initialization runs only on the first use of a fresh volume. Do not rerun historical migrations against an existing initialized database. The existing `npm run migrate` script applies only migration 006; it is not a fresh-database initializer.
@@ -98,7 +101,7 @@ npm run dashboard:build
 npm --prefix apps/dashboard run typecheck
 ```
 
-To test against your existing configured infrastructure instead, `npm test` retains its original behavior. It requires reachable PostgreSQL and Redis, a fully migrated schema, and no competing workers; remote database instability can produce connection resets or timeouts. Existing tests have not been changed or removed.
+`npm test` retains its original behavior and uses the configured database and Redis. Set `DATABASE_URL` and `REDIS_URL` explicitly to disposable local test services before running it; do not point it at a remote database or a demonstration database whose contents must be preserved. Existing tests have not been changed or removed. Milestone 9 verification uses a separate compose project/volume and ports 5546/6392, without changing the existing demo services or data.
 
 Production-build local preview (after `npm run dashboard:build`):
 
@@ -127,3 +130,11 @@ npm --prefix apps/dashboard start
 - **Unavailable queues:** start Redis; unavailable counts are displayed as unavailable, never fabricated zeros.
 - **Suppressed scenario:** enable that exact email recipient under the selected tenant before submitting a new request.
 - **Build permission errors:** Next.js launches compiler subprocesses and uses local IPC. It needs normal local process/network permissions on Windows.
+
+## Publication and remaining security limits
+
+The dashboard is unauthenticated and has no tenant authorization; tenant selection is an operator convenience. The localhost checks are a demonstration boundary, not a production authentication mechanism. Do not tunnel or publicly proxy the services. Provider acceptance is not a delivery receipt, and worker liveness is not fully instrumented.
+
+Only example environment files are tracked. Actual `.env`, `.env.demo`, frontend `.env.local`, generated files, local persistence, logs and verification reports are ignored. The original dashboard commit used disposable localhost-only demonstration defaults; that commit is preserved, as requested, without rewriting history. These were never production credentials. Current source reads the password from the ignored file and new installations generate a random value.
+
+See [MILESTONE-9-PUBLICATION.md](MILESTONE-9-PUBLICATION.md) for the final baseline comparison, test results and publication audit.
